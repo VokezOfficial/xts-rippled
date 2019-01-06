@@ -19,6 +19,7 @@
 
 #include <ripple/app/main/Application.h>
 #include <ripple/basics/StringUtilities.h>
+#include <ripple/basics/ByteUtilities.h>
 #include <ripple/net/RPCCall.h>
 #include <ripple/net/RPCErr.h>
 #include <ripple/basics/base64.h>
@@ -992,20 +993,6 @@ private:
         return jvRequest;
     }
 
-    // validation_seed [<pass_phrase>|<seed>|<seed_key>]
-    //
-    // NOTE: It is poor security to specify secret information on the command line.  This information might be saved in the command
-    // shell history file (e.g. .bash_history) and it may be leaked via the process status command (i.e. ps).
-    Json::Value parseValidationSeed (Json::Value const& jvParams)
-    {
-        Json::Value jvRequest{Json::objectValue};
-
-        if (jvParams.size ())
-            jvRequest[jss::secret]     = jvParams[0u].asString ();
-
-        return jvRequest;
-    }
-
     // wallet_propose [<passphrase>]
     // <passphrase> is only for testing. Master seeds should only be generated randomly.
     Json::Value parseWalletPropose (Json::Value const& jvParams)
@@ -1146,6 +1133,7 @@ public:
             {   "submit_multisigned",   &RPCParser::parseSubmitMultiSigned,     1,  1   },
             {   "server_info",          &RPCParser::parseServerInfo,            0,  1   },
             {   "server_state",         &RPCParser::parseServerInfo,            0,  1   },
+            {   "crawl_shards",         &RPCParser::parseAsIs,                  0,  2   },
             {   "stop",                 &RPCParser::parseAsIs,                  0,  0   },
             {   "transaction_entry",    &RPCParser::parseTransactionEntry,      2,  2   },
             {   "tx",                   &RPCParser::parseTx,                    1,  2   },
@@ -1153,7 +1141,6 @@ public:
             {   "tx_history",           &RPCParser::parseTxHistory,             1,  1   },
             {   "unl_list",             &RPCParser::parseAsIs,                  0,  0   },
             {   "validation_create",    &RPCParser::parseValidationCreate,      0,  1   },
-            {   "validation_seed",      &RPCParser::parseValidationSeed,        0,  1   },
             {   "version",              &RPCParser::parseAsIs,                  0,  0   },
             {   "wallet_propose",       &RPCParser::parseWalletPropose,         0,  1   },
             {   "internal",             &RPCParser::parseInternal,              1, -1   },
@@ -1534,7 +1521,7 @@ void fromNetwork (
 
     // Number of bytes to try to receive if no
     // Content-Length header received
-    const int RPC_REPLY_MAX_BYTES (256*1024*1024);
+    constexpr auto RPC_REPLY_MAX_BYTES = megabytes(256);
 
     using namespace std::chrono_literals;
     auto constexpr RPC_NOTIFY = 10min;

@@ -22,7 +22,6 @@
 
 #include <ripple/basics/contract.h>
 #include <ripple/core/SociDB.h>
-#include <ripple/beast/utility/Debug.h>
 #include <boost/optional.hpp>
 
 namespace ripple {
@@ -42,7 +41,8 @@ public:
         currentSchemaVersion = 4
     };
 
-    explicit StoreSqdb (beast::Journal journal = beast::Journal())
+    explicit StoreSqdb (beast::Journal journal =
+            beast::Journal {beast::Journal::getNullSink()})
         : m_journal (journal)
     {
     }

@@ -19,6 +19,7 @@
 
 #include <ripple/app/misc/ValidatorList.h>
 #include <ripple/app/misc/ValidatorSite.h>
+#include <ripple/app/misc/detail/WorkFile.h>
 #include <ripple/app/misc/detail/WorkPlain.h>
 #include <ripple/app/misc/detail/WorkSSL.h>
 #include <ripple/basics/base64.h>
@@ -26,6 +27,7 @@
 #include <ripple/json/json_reader.h>
 #include <ripple/protocol/JsonFields.h>
 #include <boost/regex.hpp>
+#include <algorithm>
 
 namespace ripple {
 
@@ -34,17 +36,46 @@ auto constexpr DEFAULT_REFRESH_INTERVAL = std::chrono::minutes{5};
 auto constexpr ERROR_RETRY_INTERVAL = std::chrono::seconds{30};
 unsigned short constexpr MAX_REDIRECTS = 3;
 
-ValidatorSite::Site::Resource::Resource (std::string u)
-    : uri {std::move(u)}
+ValidatorSite::Site::Resource::Resource (std::string uri_)
+    : uri {std::move(uri_)}
 {
-    if (! parseUrl (pUrl, uri) ||
-        (pUrl.scheme != "http" && pUrl.scheme != "https"))
-    {
-        throw std::runtime_error {"invalid url"};
-    }
+    if (! parseUrl (pUrl, uri))
+        throw std::runtime_error("URI '" + uri + "' cannot be parsed");
 
-    if (! pUrl.port)
-        pUrl.port = (pUrl.scheme == "https") ? 443 : 80;
+    if  (pUrl.scheme == "file")
+    {
+        if (!pUrl.domain.empty())
+            throw std::runtime_error("file URI cannot contain a hostname");
+
+#if _MSC_VER    // MSVC: Windows paths need the leading / removed
+        {
+            if (pUrl.path[0] == '/')
+                pUrl.path = pUrl.path.substr(1);
+
+        }
+#endif
+
+        if (pUrl.path.empty())
+            throw std::runtime_error("file URI must contain a path");
+    }
+    else if (pUrl.scheme == "http")
+    {
+        if (pUrl.domain.empty())
+            throw std::runtime_error("http URI must contain a hostname");
+
+        if (!pUrl.port)
+            pUrl.port = 80;
+    }
+    else if (pUrl.scheme == "https")
+    {
+        if (pUrl.domain.empty())
+            throw std::runtime_error("https URI must contain a hostname");
+
+        if (!pUrl.port)
+            pUrl.port = 443;
+    }
+    else
+        throw std::runtime_error ("Unsupported scheme: '" + pUrl.scheme + "'");
 }
 
 ValidatorSite::Site::Site (std::string uri)
@@ -96,16 +127,17 @@ ValidatorSite::load (
 
     std::lock_guard <std::mutex> lock{sites_mutex_};
 
-    for (auto uri : siteURIs)
+    for (auto const& uri : siteURIs)
     {
         try
         {
             sites_.emplace_back (uri);
         }
-        catch (std::exception &)
+        catch (std::exception const& e)
         {
             JLOG (j_.error()) <<
-                "Invalid validator site uri: " << uri;
+                "Invalid validator site uri: " << uri <<
+                ": " << e.what();
             return false;
         }
     }
@@ -152,11 +184,12 @@ void
 ValidatorSite::setTimer ()
 {
     std::lock_guard <std::mutex> lock{sites_mutex_};
-    auto next = sites_.end();
 
-    for (auto it = sites_.begin (); it != sites_.end (); ++it)
-        if (next == sites_.end () || it->nextRefresh < next->nextRefresh)
-            next = it;
+    auto next = std::min_element(sites_.begin(), sites_.end(),
+        [](Site const& a, Site const& b)
+        {
+            return a.nextRefresh < b.nextRefresh;
+        });
 
     if (next != sites_.end ())
     {
@@ -164,14 +197,13 @@ ValidatorSite::setTimer ()
         cv_.notify_all();
         timer_.expires_at (next->nextRefresh);
         timer_.async_wait (std::bind (&ValidatorSite::onTimer, this,
-            std::distance (sites_.begin (), next),
-                std::placeholders::_1));
+            std::distance (sites_.begin (), next), std::placeholders::_1));
     }
 }
 
 void
 ValidatorSite::makeRequest (
-    Site::ResourcePtr resource,
+    std::shared_ptr<Site::Resource> resource,
     std::size_t siteIdx,
     std::lock_guard<std::mutex>& lock)
 {
@@ -184,6 +216,12 @@ ValidatorSite::makeRequest (
             onSiteFetch (err, std::move(resp), siteIdx);
         };
 
+    auto onFetchFile =
+        [this, siteIdx] (error_code const& err, std::string const& resp)
+    {
+        onTextFetch (err, resp, siteIdx);
+    };
+
     if (resource->pUrl.scheme == "https")
     {
         sp = std::make_shared<detail::WorkSSL>(
@@ -194,7 +232,7 @@ ValidatorSite::makeRequest (
             j_,
             onFetch);
     }
-    else
+    else if(resource->pUrl.scheme == "http")
     {
         sp = std::make_shared<detail::WorkPlain>(
             resource->pUrl.domain,
@@ -202,6 +240,14 @@ ValidatorSite::makeRequest (
             std::to_string(*resource->pUrl.port),
             ios_,
             onFetch);
+    }
+    else
+    {
+        BOOST_ASSERT(resource->pUrl.scheme == "file");
+        sp = std::make_shared<detail::WorkFile>(
+            resource->pUrl.path,
+            ios_,
+            onFetchFile);
     }
 
     work_ = sp;
@@ -213,12 +259,12 @@ ValidatorSite::onTimer (
     std::size_t siteIdx,
     error_code const& ec)
 {
-    if (ec == boost::asio::error::operation_aborted)
-        return;
     if (ec)
     {
-        JLOG(j_.error()) <<
-            "ValidatorSite::onTimer: " << ec.message();
+        // Restart the timer if any errors are encountered, unless the error
+        // is from the wait operating being aborted due to a shutdown request.
+        if (ec != boost::asio::error::operation_aborted)
+            onSiteFetch(ec, detail::response_type {}, siteIdx);
         return;
     }
 
@@ -228,18 +274,29 @@ ValidatorSite::onTimer (
 
     assert(! fetching_);
     sites_[siteIdx].redirCount = 0;
-    makeRequest(sites_[siteIdx].startingResource, siteIdx, lock);
+    try
+    {
+        // the WorkSSL client can throw if SSL init fails
+        makeRequest(sites_[siteIdx].startingResource, siteIdx, lock);
+    }
+    catch (std::exception &)
+    {
+        onSiteFetch(
+            boost::system::error_code {-1, boost::system::generic_category()},
+            detail::response_type {},
+            siteIdx);
+    }
 }
 
 void
 ValidatorSite::parseJsonResponse (
-    detail::response_type& res,
+    std::string const& res,
     std::size_t siteIdx,
     std::lock_guard<std::mutex>& lock)
 {
     Json::Reader r;
     Json::Value body;
-    if (! r.parse(res.body().data(), body))
+    if (! r.parse(res.data(), body))
     {
         JLOG (j_.warn()) <<
             "Unable to parse JSON response from  " <<
@@ -319,14 +376,14 @@ ValidatorSite::parseJsonResponse (
     }
 }
 
-ValidatorSite::Site::ResourcePtr
+std::shared_ptr<ValidatorSite::Site::Resource>
 ValidatorSite::processRedirect (
     detail::response_type& res,
     std::size_t siteIdx,
     std::lock_guard<std::mutex>& lock)
 {
     using namespace boost::beast::http;
-    Site::ResourcePtr newLocation;
+    std::shared_ptr<Site::Resource> newLocation;
     if (res.find(field::location) == res.end() ||
         res[field::location].empty())
     {
@@ -354,7 +411,11 @@ ValidatorSite::processRedirect (
     {
         newLocation = std::make_shared<Site::Resource>(
             std::string(res[field::location]));
-        sites_[siteIdx].redirCount++;
+        ++sites_[siteIdx].redirCount;
+        if (newLocation->pUrl.scheme != "http" &&
+            newLocation->pUrl.scheme != "https")
+            throw std::runtime_error("invalid scheme in redirect " +
+                newLocation->pUrl.scheme);
     }
     catch (std::exception &)
     {
@@ -371,8 +432,89 @@ ValidatorSite::onSiteFetch(
     detail::response_type&& res,
     std::size_t siteIdx)
 {
-    Site::ResourcePtr newLocation;
-    bool shouldRetry = false;
+    {
+        std::lock_guard <std::mutex> lock_sites{sites_mutex_};
+        auto onError = [&](std::string const& errMsg, bool retry)
+        {
+            sites_[siteIdx].lastRefreshStatus.emplace(
+                Site::Status{clock_type::now(),
+                            ListDisposition::invalid,
+                            errMsg});
+            if (retry)
+                sites_[siteIdx].nextRefresh =
+                        clock_type::now() + ERROR_RETRY_INTERVAL;
+        };
+        if (ec)
+        {
+            JLOG (j_.warn()) <<
+                    "Problem retrieving from " <<
+                    sites_[siteIdx].activeResource->uri <<
+                    " " <<
+                    ec.value() <<
+                    ":" <<
+                    ec.message();
+            onError("fetch error", true);
+        }
+        else
+        {
+            try
+            {
+                using namespace boost::beast::http;
+                switch (res.result())
+                {
+                case status::ok:
+                    parseJsonResponse(res.body(), siteIdx, lock_sites);
+                    break;
+                case status::moved_permanently :
+                case status::permanent_redirect :
+                case status::found :
+                case status::temporary_redirect :
+                {
+                    auto newLocation =
+                        processRedirect (res, siteIdx, lock_sites);
+                    assert(newLocation);
+                    // for perm redirects, also update our starting URI
+                    if (res.result() == status::moved_permanently ||
+                        res.result() == status::permanent_redirect)
+                    {
+                        sites_[siteIdx].startingResource = newLocation;
+                    }
+                    makeRequest(newLocation, siteIdx, lock_sites);
+                    return; // we are still fetching, so skip
+                            // state update/notify below
+                }
+                default:
+                {
+                    JLOG (j_.warn()) <<
+                        "Request for validator list at " <<
+                        sites_[siteIdx].activeResource->uri <<
+                        " returned bad status: " <<
+                        res.result_int();
+                    onError("bad result code", true);
+                }
+                }
+            }
+            catch (std::exception& ex)
+            {
+                onError(ex.what(), false);
+            }
+        }
+        sites_[siteIdx].activeResource.reset();
+    }
+
+    std::lock_guard <std::mutex> lock_state{state_mutex_};
+    fetching_ = false;
+    if (! stopping_)
+        setTimer ();
+    cv_.notify_all();
+}
+
+void
+ValidatorSite::onTextFetch(
+    boost::system::error_code const& ec,
+    std::string const& res,
+    std::size_t siteIdx)
+{
     {
         std::lock_guard <std::mutex> lock_sites{sites_mutex_};
         try
@@ -386,47 +528,10 @@ ValidatorSite::onSiteFetch(
                     ec.value() <<
                     ":" <<
                     ec.message();
-                shouldRetry = true;
                 throw std::runtime_error{"fetch error"};
             }
-            else
-            {
-                using namespace boost::beast::http;
-                if (res.result() == status::ok)
-                {
-                    parseJsonResponse(res, siteIdx, lock_sites);
-                }
-                else if (res.result() == status::moved_permanently  ||
-                         res.result() == status::permanent_redirect ||
-                         res.result() == status::found              ||
-                         res.result() == status::temporary_redirect)
-                {
-                    newLocation = processRedirect (res, siteIdx, lock_sites);
-                    // for perm redirects, also update our starting URI
-                    if (res.result() == status::moved_permanently ||
-                        res.result() == status::permanent_redirect)
-                    {
-                        sites_[siteIdx].startingResource = newLocation;
-                    }
-                }
-                else
-                {
-                    JLOG (j_.warn()) <<
-                        "Request for validator list at " <<
-                        sites_[siteIdx].activeResource->uri <<
-                        " returned bad status: " <<
-                        res.result_int();
-                    shouldRetry = true;
-                    throw std::runtime_error{"bad result code"};
-                }
 
-                if (newLocation)
-                {
-                    makeRequest(newLocation, siteIdx, lock_sites);
-                    return; // we are still fetching, so skip
-                            // state update/notify below
-                }
-            }
+            parseJsonResponse(res, siteIdx, lock_sites);
         }
         catch (std::exception& ex)
         {
@@ -434,9 +539,6 @@ ValidatorSite::onSiteFetch(
                 Site::Status{clock_type::now(),
                 ListDisposition::invalid,
                 ex.what()});
-            if (shouldRetry)
-                sites_[siteIdx].nextRefresh =
-                    clock_type::now() + ERROR_RETRY_INTERVAL;
         }
         sites_[siteIdx].activeResource.reset();
     }

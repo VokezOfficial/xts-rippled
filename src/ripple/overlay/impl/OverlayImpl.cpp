@@ -88,7 +88,6 @@ OverlayImpl::Timer::stop()
 void
 OverlayImpl::Timer::run()
 {
-    error_code ec;
     timer_.expires_from_now (std::chrono::seconds(1));
     timer_.async_wait(overlay_.strand_.wrap(
         std::bind(&Timer::on_timer, shared_from_this(),
@@ -485,13 +484,22 @@ OverlayImpl::onPrepare()
     m_peerFinder->setConfig (config);
 
     // Populate our boot cache: if there are no entries in [ips] then we use
-    // the entries in [ips_fixed]. If both are empty, we resort to a round-robin
-    // pool.
+    // the entries in [ips_fixed].
     auto bootstrapIps = app_.config().IPS.empty()
         ? app_.config().IPS_FIXED
         : app_.config().IPS;
+
+
+    // If nothing is specified, default to several well-known high-capacity
+    // servers to serve as bootstrap:
     if (bootstrapIps.empty ())
-        bootstrapIps.push_back ("r.ripple.com 51235");
+    {
+        // Pool of servers operated by Ripple Labs Inc. - https://ripple.com
+        bootstrapIps.push_back("r.ripple.com 51235");
+
+        // Pool of servers operated by Alloy Networks - https://www.alloy.ee
+        bootstrapIps.push_back("zaphod.alloy.ee 51235");
+    }
 
     m_resolver.resolve (bootstrapIps,
         [this](std::string const& name,
@@ -708,6 +716,102 @@ OverlayImpl::reportTraffic (
     m_traffic.addCount (cat, isInbound, number);
 }
 
+Json::Value
+OverlayImpl::crawlShards(bool pubKey, std::uint32_t hops)
+{
+    using namespace std::chrono;
+    using namespace std::chrono_literals;
+
+    Json::Value jv(Json::objectValue);
+    auto const numPeers {size()};
+    if (numPeers == 0)
+        return jv;
+
+    // If greater than a hop away, we may need to gather or freshen data
+    if (hops > 0)
+    {
+        // Prevent crawl spamming
+        clock_type::time_point const last(csLast_.load());
+        if ((clock_type::now() - last) > 60s)
+        {
+            auto const timeout(seconds((hops * hops) * 10));
+            std::unique_lock<std::mutex> l {csMutex_};
+
+            // Check if already requested
+            if (csIDs_.empty())
+            {
+                {
+                    std::lock_guard <decltype(mutex_)> lock {mutex_};
+                    for (auto& id : ids_)
+                        csIDs_.emplace(id.first);
+                }
+
+                // Relay request to active peers
+                protocol::TMGetShardInfo tmGS;
+                tmGS.set_hops(hops);
+                foreach(send_always(std::make_shared<Message>(
+                    tmGS, protocol::mtGET_SHARD_INFO)));
+
+                if (csCV_.wait_for(l, timeout) == std::cv_status::timeout)
+                {
+                    csIDs_.clear();
+                    csCV_.notify_all();
+                }
+                csLast_ = duration_cast<seconds>(
+                    clock_type::now().time_since_epoch());
+            }
+            else
+                csCV_.wait_for(l, timeout);
+        }
+    }
+
+    // Combine the shard info from peers and their sub peers
+    hash_map<PublicKey, PeerImp::ShardInfo> peerShardInfo;
+    for_each([&](std::shared_ptr<PeerImp> const& peer)
+    {
+        if (auto psi = peer->getPeerShardInfo())
+        {
+            for (auto const& e : *psi)
+            {
+                auto it {peerShardInfo.find(e.first)};
+                if (it != peerShardInfo.end())
+                    // The key exists so join the shard indexes.
+                    it->second.shardIndexes += e.second.shardIndexes;
+                else
+                    peerShardInfo.emplace(std::move(e));
+            }
+        }
+    });
+
+    // Prepare json reply
+    auto& av = jv[jss::peers] = Json::Value(Json::arrayValue);
+    for (auto const& e : peerShardInfo)
+    {
+        auto& pv {av.append(Json::Value(Json::objectValue))};
+        if (pubKey)
+            pv[jss::public_key] = toBase58(TokenType::NodePublic, e.first);
+
+        auto const& address {e.second.endpoint.address()};
+        if (!address.is_unspecified())
+            pv[jss::ip] = address.to_string();
+
+        pv[jss::complete_shards] = to_string(e.second.shardIndexes);
+    }
+
+    return jv;
+}
+
+void
+OverlayImpl::lastLink(std::uint32_t id)
+{
+    // Notify threads when every peer has received a last link.
+    // This doesn't account for every node that might reply but
+    // it is adequate.
+    std::lock_guard<std::mutex> l {csMutex_};
+    if (csIDs_.erase(id) && csIDs_.empty())
+        csCV_.notify_all();
+}
+
 std::size_t
 OverlayImpl::selectPeers (PeerSet& set, std::size_t limit,
     std::function<bool(std::shared_ptr<Peer> const&)> score)
@@ -787,9 +891,12 @@ OverlayImpl::crawl()
                     sp->getRemoteAddress().port());
             }
         }
-        auto version = sp->getVersion ();
-        if (! version.empty ())
-            pv[jss::version] = version;
+
+        {
+            auto version {sp->getVersion()};
+            if (!version.empty())
+                pv[jss::version] = std::move(version);
+        }
 
         std::uint32_t minSeq, maxSeq;
         sp->ledgerRange(minSeq, maxSeq);
@@ -798,9 +905,8 @@ OverlayImpl::crawl()
                 std::to_string(minSeq) + "-" +
                     std::to_string(maxSeq);
 
-        auto shards = sp->getShards();
-        if (! shards.empty())
-            pv[jss::complete_shards] = shards;
+        if (auto shardIndexes = sp->getShardIndexes())
+            pv[jss::complete_shards] = to_string(*shardIndexes);
     });
 
     return jv;

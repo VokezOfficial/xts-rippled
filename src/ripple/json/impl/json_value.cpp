@@ -348,10 +348,10 @@ Value::~Value ()
 }
 
 Value&
-Value::operator= ( const Value& other )
+Value::operator=(Value const& other)
 {
-    Value temp ( other );
-    swap ( temp );
+    Value tmp(other);
+    swap(tmp);
     return *this;
 }
 
@@ -365,9 +365,10 @@ Value::Value ( Value&& other ) noexcept
 }
 
 Value&
-Value::operator= ( Value&& other ) noexcept
+Value::operator=(Value&& other)
 {
-    swap ( other );
+    Value tmp(std::move(other));
+    swap(tmp);
     return *this;
 }
 
@@ -522,7 +523,11 @@ Value::asString () const
         return beast::lexicalCastThrow <std::string> (value_.int_);
 
     case uintValue:
+        return beast::lexicalCastThrow <std::string> (value_.uint_);
+
     case realValue:
+        return beast::lexicalCastThrow <std::string> (value_.real_);
+
     case arrayValue:
     case objectValue:
         JSON_ASSERT_MESSAGE ( false, "Type is not convertible to string" );

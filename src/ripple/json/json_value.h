@@ -233,10 +233,10 @@ public:
     Value ( const Value& other );
     ~Value ();
 
-    Value& operator= ( const Value& other );
+    Value& operator= ( Value const& other );
+    Value& operator= ( Value&& other );
 
     Value ( Value&& other ) noexcept;
-    Value& operator= ( Value&& other ) noexcept;
 
     /// Swap values.
     /// \note Currently, comments are intentionally not swapped, for
@@ -246,12 +246,14 @@ public:
     ValueType type () const;
 
     const char* asCString () const;
+    /** Returns the unquoted string value. */
     std::string asString () const;
     Int asInt () const;
     UInt asUInt () const;
     double asDouble () const;
     bool asBool () const;
 
+    // TODO: What is the "empty()" method this docstring mentions?
     /** isNull() tests to see if this field is null.  Don't use this method to
         test for emptiness: use empty(). */
     bool isNull () const;

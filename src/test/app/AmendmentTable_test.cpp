@@ -22,13 +22,14 @@
 #include <ripple/basics/BasicConfig.h>
 #include <ripple/basics/chrono.h>
 #include <ripple/basics/Log.h>
+#include <ripple/beast/unit_test.h>
 #include <ripple/core/ConfigSections.h>
 #include <ripple/protocol/Feature.h>
 #include <ripple/protocol/PublicKey.h>
 #include <ripple/protocol/SecretKey.h>
 #include <ripple/protocol/digest.h>
 #include <ripple/protocol/TxFlags.h>
-#include <ripple/beast/unit_test.h>
+#include <test/unit_test/SuiteJournal.h>
 
 namespace ripple
 {
@@ -89,12 +90,15 @@ private:
 
     Section const emptySection;
 
+    test::SuiteJournal journal;
+
 public:
     AmendmentTable_test ()
         : m_set1 (createSet (1, 12))
         , m_set2 (createSet (2, 12))
         , m_set3 (createSet (3, 12))
         , m_set4 (createSet (4, 12))
+        , journal ("AmendmentTable_test", *this)
     {
     }
 
@@ -111,7 +115,7 @@ public:
             supported,
             enabled,
             vetoed,
-            beast::Journal{});
+            journal);
     }
 
     std::unique_ptr<AmendmentTable>
@@ -733,16 +737,6 @@ public:
         }
     }
 
-    void
-    testSupportedAmendments ()
-    {
-        for (auto const& amend : detail::supportedAmendments ())
-        {
-            auto const f = getRegisteredFeature(amend.substr (65));
-            BEAST_EXPECT(f && amend.substr (0, 64) == to_string (*f));
-        }
-    }
-
     void testHasUnsupported ()
     {
         testcase ("hasUnsupportedEnabled");
@@ -768,7 +762,6 @@ public:
         testVoteEnable ();
         testDetectMajority ();
         testLostMajority ();
-        testSupportedAmendments ();
         testHasUnsupported ();
     }
 };

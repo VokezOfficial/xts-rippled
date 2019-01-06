@@ -44,6 +44,7 @@
 #include <ripple/app/misc/ValidatorKeys.h>
 #include <ripple/app/paths/PathRequests.h>
 #include <ripple/app/tx/apply.h>
+#include <ripple/basics/ByteUtilities.h>
 #include <ripple/basics/ResolverAsio.h>
 #include <ripple/basics/Sustain.h>
 #include <ripple/basics/PerfLog.h>
@@ -59,10 +60,12 @@
 #include <ripple/beast/core/LexicalCast.h>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/system/error_code.hpp>
-#include <fstream>
-#include <sstream>
-#include <iostream>
+#include <condition_variable>
 #include <cstring>
+#include <fstream>
+#include <iostream>
+#include <mutex>
+#include <sstream>
 
 namespace ripple {
 
@@ -367,7 +370,10 @@ public:
     std::vector <std::unique_ptr<Stoppable>> websocketServers_;
 
     boost::asio::signal_set m_signals;
-    beast::WaitableEvent m_stop;
+
+    std::condition_variable cv_;
+    std::mutex mut_;
+    bool isTimeToStop = false;
 
     std::atomic<bool> checkSigs_;
 
@@ -608,7 +614,6 @@ public:
     {
         return nodeIdentity_;
     }
-
 
     PublicKey const &
     getValidationPublicKey() const override
@@ -1029,8 +1034,7 @@ public:
             boost::filesystem::space_info space =
                 boost::filesystem::space (config_->legacy ("database_path"));
 
-            constexpr std::uintmax_t bytes512M = 512 * 1024 * 1024;
-            if (space.available < (bytes512M))
+            if (space.available < megabytes(512))
             {
                 JLOG(m_journal.fatal())
                     << "Remaining free disk space is less than 512MB";
@@ -1074,7 +1078,7 @@ public:
                << "Note that this does not take into account available disk "
                   "space.";
 
-            if (freeSpace < bytes512M)
+            if (freeSpace < megabytes(512))
             {
                 JLOG(m_journal.fatal())
                     << "Free SQLite space for transaction db is less than "
@@ -1194,11 +1198,11 @@ bool ApplicationImp::setup()
 
     getLedgerDB ().getSession ()
         << boost::str (boost::format ("PRAGMA cache_size=-%d;") %
-                        (config_->getSize (siLgrDBCache) * 1024));
+                        (config_->getSize (siLgrDBCache) * kilobytes(1)));
 
     getTxnDB ().getSession ()
             << boost::str (boost::format ("PRAGMA cache_size=-%d;") %
-                            (config_->getSize (siTxnDBCache) * 1024));
+                            (config_->getSize (siTxnDBCache) * kilobytes(1)));
 
     mTxnDB->setupCheckpointing (m_jobQueue.get(), logs());
     mLedgerDB->setupCheckpointing (m_jobQueue.get(), logs());
@@ -1208,8 +1212,18 @@ bool ApplicationImp::setup()
 
     // Configure the amendments the server supports
     {
+        auto const& sa = detail::supportedAmendments();
+        std::vector<std::string> saHashes;
+        saHashes.reserve(sa.size());
+        for (auto const& name : sa)
+        {
+            auto const f = getRegisteredFeature(name);
+            BOOST_ASSERT(f);
+            if (f)
+                saHashes.push_back(to_string(*f) + " " + name);
+        }
         Section supportedAmendments ("Supported Amendments");
-        supportedAmendments.append (detail::supportedAmendments ());
+        supportedAmendments.append (saHashes);
 
         Section enabledAmendments = config_->section (SECTION_AMENDMENTS);
 
@@ -1475,7 +1489,10 @@ ApplicationImp::run()
         getLoadManager ().activateDeadlockDetector ();
     }
 
-    m_stop.wait ();
+    {
+        std::unique_lock<std::mutex> lk{mut_};
+        cv_.wait(lk, [this]{return isTimeToStop;});
+    }
 
     // Stop the server. When this returns, all
     // Stoppable objects should be stopped.
@@ -1490,7 +1507,9 @@ ApplicationImp::signalStop()
 {
     // Unblock the main thread (which is sitting in run()).
     //
-    m_stop.signal();
+    std::lock_guard<std::mutex> lk{mut_};
+    isTimeToStop = true;
+    cv_.notify_all();
 }
 
 bool

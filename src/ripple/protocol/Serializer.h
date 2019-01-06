@@ -49,14 +49,15 @@ public:
         mData.reserve (n);
     }
 
-    Serializer (void const* data,
-        std::size_t size)
+    Serializer (void const* data, std::size_t size)
     {
         mData.resize(size);
-        std::memcpy(mData.data(),
-            reinterpret_cast<
-                unsigned char const*>(
-                    data), size);
+
+        if (size)
+        {
+            assert(data != nullptr);
+            std::memcpy(mData.data(), data, size);
+        }
     }
 
     Slice slice() const noexcept
@@ -316,6 +317,14 @@ public:
     SerialIter (Slice const& slice)
         : SerialIter(slice.data(), slice.size())
     {
+    }
+
+    // Infer the size of the data based on the size of the passed array.
+    template<int N>
+    explicit SerialIter (std::uint8_t const (&data)[N])
+        : SerialIter(&data[0], N)
+    {
+        static_assert (N > 0, "");
     }
 
     std::size_t

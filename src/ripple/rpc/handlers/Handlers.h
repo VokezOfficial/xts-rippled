@@ -69,6 +69,7 @@ Json::Value doServerInfo            (RPC::Context&); // for humans
 Json::Value doServerState           (RPC::Context&); // for machines
 Json::Value doSign                  (RPC::Context&);
 Json::Value doSignFor               (RPC::Context&);
+Json::Value doCrawlShards           (RPC::Context&);
 Json::Value doStop                  (RPC::Context&);
 Json::Value doSubmit                (RPC::Context&);
 Json::Value doSubmitMultiSigned     (RPC::Context&);
@@ -79,7 +80,6 @@ Json::Value doTxHistory             (RPC::Context&);
 Json::Value doUnlList               (RPC::Context&);
 Json::Value doUnsubscribe           (RPC::Context&);
 Json::Value doValidationCreate      (RPC::Context&);
-Json::Value doValidationSeed        (RPC::Context&);
 Json::Value doWalletPropose         (RPC::Context&);
 Json::Value doValidators            (RPC::Context&);
 Json::Value doValidatorListSites    (RPC::Context&);

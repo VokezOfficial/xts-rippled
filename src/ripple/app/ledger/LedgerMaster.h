@@ -118,6 +118,12 @@ public:
         std::shared_ptr<Ledger const> const& ledger,
             bool isSynchronous, bool isCurrent);
 
+    /** Check the sequence number and parent close time of a
+        ledger against our clock and last validated ledger to
+        see if it can be the network's current ledger
+    */
+    bool canBeCurrent (std::shared_ptr<Ledger const> const& ledger);
+
     void switchLCL (std::shared_ptr<Ledger const> const& lastClosed);
 
     void failedSave(std::uint32_t seq, uint256 const& hash);
@@ -256,7 +262,7 @@ private:
         std::shared_ptr<Ledger const> ledger);
 
     void getFetchPack(
-        LedgerIndex missingIndex, InboundLedger::Reason reason);
+        LedgerIndex missing, InboundLedger::Reason reason);
 
     boost::optional<LedgerHash> getLedgerHashForHistory(
         LedgerIndex index, InboundLedger::Reason reason);
@@ -336,6 +342,8 @@ private:
 
     int     mPathFindThread {0};    // Pathfinder jobs dispatched
     bool    mPathFindNewRequest {false};
+
+    std::atomic_flag mGotFetchPackThread = ATOMIC_FLAG_INIT; // GotFetchPack jobs dispatched
 
     std::atomic <std::uint32_t> mPubLedgerClose {0};
     std::atomic <LedgerIndex> mPubLedgerSeq {0};

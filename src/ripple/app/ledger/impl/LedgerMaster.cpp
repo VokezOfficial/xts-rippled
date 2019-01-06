@@ -59,6 +59,9 @@ using namespace std::chrono_literals;
 // Don't acquire history if ledger is too old
 auto constexpr MAX_LEDGER_AGE_ACQUIRE = 1min;
 
+// Don't acquire history if write load is too high
+auto constexpr MAX_WRITE_LOAD_ACQUIRE = 8192;
+
 LedgerMaster::LedgerMaster (Application& app, Stopwatch& stopwatch,
     Stoppable& parent,
     beast::insight::Collector::ptr const& collector, beast::Journal journal)
@@ -248,6 +251,72 @@ LedgerMaster::addHeldTransaction (
 {
     ScopedLockType ml (m_mutex);
     mHeldTransactions.insert (transaction->getSTransaction ());
+}
+
+// Validate a ledger's close time and sequence number if we're considering
+// jumping to that ledger. This helps defend agains some rare hostile or
+// insane majority scenarios.
+bool
+LedgerMaster::canBeCurrent (std::shared_ptr<Ledger const> const& ledger)
+{
+    assert (ledger);
+
+    // Never jump to a candidate ledger that precedes our
+    // last validated ledger
+
+    auto validLedger = getValidatedLedger();
+    if (validLedger &&
+        (ledger->info().seq < validLedger->info().seq))
+    {
+        JLOG (m_journal.trace()) << "Candidate for current ledger has low seq "
+            << ledger->info().seq << " < " << validLedger->info().seq;
+        return false;
+    }
+
+    // Ensure this ledger's parent close time is within five minutes of
+    // our current time. If we already have a known fully-valid ledger
+    // we perform this check. Otherwise, we only do it if we've built a
+    // few ledgers as our clock can be off when we first start up
+
+    auto closeTime = app_.timeKeeper().closeTime();
+    auto ledgerClose = ledger->info().parentCloseTime;
+
+    if ((validLedger || (ledger->info().seq > 10)) &&
+        ((std::max (closeTime, ledgerClose) - std::min (closeTime, ledgerClose))
+            > 5min))
+    {
+        JLOG (m_journal.warn()) << "Candidate for current ledger has close time "
+            << to_string(ledgerClose) << " at network time "
+            << to_string(closeTime) << " seq " << ledger->info().seq;
+        return false;
+    }
+
+    if (validLedger)
+    {
+        // Sequence number must not be too high. We allow ten ledgers
+        // for time inaccuracies plus a maximum run rate of one ledger
+        // every two seconds. The goal is to prevent a malicious ledger
+        // from increasing our sequence unreasonably high
+
+        LedgerIndex maxSeq = validLedger->info().seq + 10;
+
+        if (closeTime > validLedger->info().parentCloseTime)
+            maxSeq += std::chrono::duration_cast<std::chrono::seconds>(
+                closeTime - validLedger->info().parentCloseTime).count() / 2;
+
+        if (ledger->info().seq > maxSeq)
+        {
+            JLOG (m_journal.warn()) << "Candidate for current ledger has high seq "
+                << ledger->info().seq << " > " << maxSeq;
+            return false;
+        }
+
+        JLOG (m_journal.trace()) << "Acceptable seq range: " <<
+            validLedger->info().seq << " <= " <<
+            ledger->info().seq << " <= " << maxSeq;
+    }
+
+    return true;
 }
 
 void
@@ -516,16 +585,29 @@ LedgerMaster::tryFill (
 /** Request a fetch pack to get to the specified ledger
 */
 void
-LedgerMaster::getFetchPack (LedgerIndex missingIndex,
+LedgerMaster::getFetchPack (LedgerIndex missing,
     InboundLedger::Reason reason)
 {
-    auto haveHash = getLedgerHashForHistory(
-        missingIndex + 1, reason);
+    auto haveHash {getLedgerHashForHistory(missing + 1, reason)};
     if (!haveHash || haveHash->isZero())
     {
-        JLOG (m_journal.error()) <<
-            "No hash for fetch pack. Missing Index " <<
-            std::to_string(missingIndex);
+        if (reason == InboundLedger::Reason::SHARD)
+        {
+            auto const shardStore {app_.getShardStore()};
+            auto const shardIndex {shardStore->seqToShardIndex(missing)};
+            if (missing < shardStore->lastLedgerSeq(shardIndex))
+            {
+                 JLOG(m_journal.error())
+                    << "No hash for fetch pack. "
+                    << "Missing ledger sequence " << missing
+                    << " while acquiring shard " << shardIndex;
+            }
+        }
+        else
+        {
+            JLOG(m_journal.error()) <<
+                "No hash for fetch pack. Missing Index " << missing;
+        }
         return;
     }
 
@@ -537,7 +619,7 @@ LedgerMaster::getFetchPack (LedgerIndex missingIndex,
         auto peerList = app_.overlay ().getActivePeers();
         for (auto const& peer : peerList)
         {
-            if (peer->hasRange (missingIndex, missingIndex + 1))
+            if (peer->hasRange (missing, missing + 1))
             {
                 int score = peer->getScore (true);
                 if (! target || (score > maxScore))
@@ -559,8 +641,7 @@ LedgerMaster::getFetchPack (LedgerIndex missingIndex,
             tmBH, protocol::mtGET_OBJECTS);
 
         target->send (packet);
-        JLOG (m_journal.trace()) << "Requested fetch pack for "
-                                            << missingIndex;
+        JLOG(m_journal.trace()) << "Requested fetch pack for " << missing;
     }
     else
         JLOG (m_journal.debug()) << "No peer for fetch pack";
@@ -757,7 +838,9 @@ void
 LedgerMaster::checkAccept (
     std::shared_ptr<Ledger const> const& ledger)
 {
-    if (ledger->info().seq <= mValidLedgerSeq)
+    // Can we accept this ledger as our new last fully-validated ledger
+
+    if (! canBeCurrent (ledger))
         return;
 
     // Can we advance the last fully-validated ledger? If so, can we
@@ -1668,7 +1751,8 @@ void LedgerMaster::doAdvance (ScopedLockType& sl)
             if (!standalone_ && !app_.getFeeTrack().isLoadedLocal() &&
                 (app_.getJobQueue().getJobCount(jtPUBOLDLEDGER) < 10) &&
                 (mValidLedgerSeq == mPubLedgerSeq) &&
-                (getValidatedLedgerAge() < MAX_LEDGER_AGE_ACQUIRE))
+                (getValidatedLedgerAge() < MAX_LEDGER_AGE_ACQUIRE) &&
+                (app_.getNodeStore().getWriteLoad() < MAX_WRITE_LOAD_ACQUIRE))
             {
                 // We are in sync, so can acquire
                 InboundLedger::Reason reason = InboundLedger::Reason::HISTORY;
@@ -1778,13 +1862,16 @@ LedgerMaster::gotFetchPack (
     bool progress,
     std::uint32_t seq)
 {
-    // FIXME: Calling this function more than once will result in
-    // InboundLedgers::gotFetchPack being called more than once
-    // which is expensive. A flag should track whether we've already dispatched
-
-    app_.getJobQueue().addJob (
-        jtLEDGER_DATA, "gotFetchPack",
-        [&] (Job&) { app_.getInboundLedgers().gotFetchPack(); });
+    if (!mGotFetchPackThread.test_and_set(std::memory_order_acquire))
+    {
+        app_.getJobQueue().addJob (
+            jtLEDGER_DATA, "gotFetchPack",
+            [&] (Job&)
+            {
+                app_.getInboundLedgers().gotFetchPack();
+                mGotFetchPackThread.clear(std::memory_order_release);
+            });
+    }
 }
 
 void

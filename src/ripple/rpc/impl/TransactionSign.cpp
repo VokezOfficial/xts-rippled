@@ -374,8 +374,8 @@ transactionPreProcessImpl (
     if (!verify && !tx_json.isMember (jss::Sequence))
         return RPC::missing_field_error ("tx_json.Sequence");
 
-    std::shared_ptr<SLE const> sle = cachedRead(*ledger,
-        keylet::account(srcAddressID).key, ltACCOUNT_ROOT);
+    std::shared_ptr<SLE const> sle = ledger->read(
+            keylet::account(srcAddressID));
 
     if (verify && !sle)
     {
@@ -496,6 +496,10 @@ transactionPreProcessImpl (
 
         stpTrans = std::make_shared<STTx> (
             std::move (parsed.object.get()));
+    }
+    catch (STObject::FieldErr& err)
+    {
+        return RPC::make_error (rpcINVALID_PARAMS, err.what());
     }
     catch (std::exception&)
     {
@@ -699,21 +703,15 @@ Json::Value checkFee (
             ledger->fees(), isUnlimited (role));
     std::uint64_t fee = loadFee;
     {
-        auto const assumeTx = request.isMember("x_assume_tx") &&
-            request["x_assume_tx"].isConvertibleTo(Json::uintValue) ?
-                request["x_assume_tx"].asUInt() : 0;
-        auto const metrics = txQ.getMetrics(*ledger, assumeTx);
-        if(metrics)
-        {
-            auto const baseFee = ledger->fees().base;
-            auto escalatedFee = mulDiv(
-                metrics->expFeeLevel, baseFee,
-                    metrics->referenceFeeLevel).second;
-            if (mulDiv(escalatedFee, metrics->referenceFeeLevel,
-                    baseFee).second < metrics->expFeeLevel)
-                ++escalatedFee;
-            fee = std::max(fee, escalatedFee);
-        }
+        auto const metrics = txQ.getMetrics(*ledger);
+        auto const baseFee = ledger->fees().base;
+        auto escalatedFee = mulDiv(
+            metrics.openLedgerFeeLevel, baseFee,
+                metrics.referenceFeeLevel).second;
+        if (mulDiv(escalatedFee, metrics.referenceFeeLevel,
+                baseFee).second < metrics.openLedgerFeeLevel)
+            ++escalatedFee;
+        fee = std::max(fee, escalatedFee);
     }
 
     auto const limit = [&]()
@@ -729,13 +727,6 @@ Json::Value checkFee (
         return result.second;
     }();
 
-    if (fee > limit && fee != loadFee &&
-        request.isMember("x_queue_okay") &&
-            request["x_queue_okay"].isBool() &&
-                request["x_queue_okay"].asBool())
-    {
-        fee = std::max(loadFee, limit);
-    }
     if (fee > limit)
     {
         std::stringstream ss;
@@ -981,12 +972,11 @@ Json::Value transactionSignFor (
         return preprocResult.first;
 
     {
+        std::shared_ptr<SLE const> account_state = ledger->read(
+                keylet::account(*signerAccountID));
         // Make sure the account and secret belong together.
         auto const err = acctMatchesPubKey (
-            cachedRead(
-                *ledger,
-                keylet::account(*signerAccountID).key,
-                ltACCOUNT_ROOT),
+            account_state,
             *signerAccountID,
             multiSignPubKey);
 
@@ -1060,8 +1050,8 @@ Json::Value transactionSubmitMultiSigned (
 
     auto const srcAddressID = txJsonResult.second;
 
-    std::shared_ptr<SLE const> sle = cachedRead(*ledger,
-        keylet::account(srcAddressID).key, ltACCOUNT_ROOT);
+    std::shared_ptr<SLE const> sle = ledger->read(
+            keylet::account(srcAddressID));
 
     if (!sle)
     {
@@ -1111,6 +1101,10 @@ Json::Value transactionSubmitMultiSigned (
         {
             stpTrans = std::make_shared<STTx>(
                 std::move(parsedTx_json.object.get()));
+        }
+        catch (STObject::FieldErr& err)
+        {
+            return RPC::make_error (rpcINVALID_PARAMS, err.what());
         }
         catch (std::exception& ex)
         {

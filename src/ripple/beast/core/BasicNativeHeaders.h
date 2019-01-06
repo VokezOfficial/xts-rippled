@@ -272,7 +272,6 @@
  #if BEAST_LINUX || BEAST_ANDROID
   #include <sys/types.h>
   #include <sys/socket.h>
-  #include <sys/errno.h>
   #include <unistd.h>
   #include <netinet/in.h>
  #endif
@@ -289,11 +288,7 @@
  #include <sys/time.h>
  #include <net/if.h>
  #include <sys/ioctl.h>
-
- #if ! BEAST_ANDROID && ! BEAST_BSD
-  #include <execinfo.h>
- #endif
-#endif
+#endif	
 
 #if BEAST_MAC || BEAST_IOS
  #include <xlocale.h>

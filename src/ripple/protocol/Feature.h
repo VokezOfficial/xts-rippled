@@ -80,7 +80,10 @@ class FeatureCollections
         "fix1543",
         "fix1623",
         "DepositPreauth",
-        "fix1515"
+        "fix1515",
+        "fix1578",
+        "MultiSignReserve",
+        "fixTakerDryOfferRemoval"
     };
 
     std::vector<uint256> features;
@@ -339,7 +342,6 @@ foreachFeature(FeatureBitset bs, F&& f)
 extern uint256 const featureMultiSign;
 extern uint256 const featureTickets;
 extern uint256 const featureTrustSetAuth;
-extern uint256 const featureFeeEscalation;
 extern uint256 const featureOwnerPaysFee;
 extern uint256 const featureCompareFlowV1V2;
 extern uint256 const featureSHAMapV2;
@@ -367,6 +369,9 @@ extern uint256 const fix1543;
 extern uint256 const fix1623;
 extern uint256 const featureDepositPreauth;
 extern uint256 const fix1515;
+extern uint256 const fix1578;
+extern uint256 const featureMultiSignReserve;
+extern uint256 const fixTakerDryOfferRemoval;
 
 } // ripple
 

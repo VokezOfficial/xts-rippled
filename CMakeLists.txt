@@ -1,9 +1,13 @@
 
 cmake_minimum_required (VERSION 3.9.0)
 set (CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/Builds/CMake ${CMAKE_MODULE_PATH})
-include (CMakeFuncs)
 include (CheckCXXCompilerFlag)
+if (CMAKE_VERSION VERSION_GREATER_EQUAL 3.11)
+  include (FetchContent)
+endif ()
 include (ExternalProject)
+include (CMakeFuncs) # must come *after* ExternalProject b/c it overrides one function in EP
+include (ProcessorCount)
 if (target)
   message (WARNING
     "The target option is deprecated and will be removed in a future release")
@@ -15,10 +19,23 @@ project (rippled)
    convenience variables and sanity checks
 #]===================================================================]
 
+ProcessorCount(num_procs)
 get_property (is_multiconfig GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 if (is_multiconfig STREQUAL "NOTFOUND")
   if (${CMAKE_GENERATOR} STREQUAL "Xcode" OR ${CMAKE_GENERATOR} MATCHES "^Visual Studio")
     set (is_multiconfig TRUE)
+  endif ()
+endif ()
+
+set (CMAKE_CONFIGURATION_TYPES "Debug;Release" CACHE STRING "" FORCE)
+if (NOT is_multiconfig)
+  if (NOT CMAKE_BUILD_TYPE)
+    message (STATUS "Build type not specified - defaulting to Release")
+    set (CMAKE_BUILD_TYPE Release CACHE STRING "build type" FORCE)
+  elseif (NOT (CMAKE_BUILD_TYPE STREQUAL Debug OR CMAKE_BUILD_TYPE STREQUAL Release))
+    # for simplicity, these are the only two config types we care about. Limiting
+    # the build types simplifies dealing with external project builds especially
+    message (FATAL_ERROR " *** Only Debug or Release build types are currently supported ***")
   endif ()
 endif ()
 
@@ -36,7 +53,7 @@ elseif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
     message (FATAL_ERROR "This project requires GCC 5.1 or later")
   endif ()
 endif ()
-if (${CMAKE_GENERATOR} STREQUAL "Xcode")
+if (CMAKE_GENERATOR STREQUAL "Xcode")
   set (is_xcode TRUE)
 endif ()
 
@@ -44,11 +61,6 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set (is_linux TRUE)
 else ()
   set (is_linux FALSE)
-endif ()
-
-if (NOT is_multiconfig AND NOT CMAKE_BUILD_TYPE)
-  message (STATUS "Build type not specified - defaulting to Release")
-  set (CMAKE_BUILD_TYPE Release CACHE STRING "build type" FORCE)
 endif ()
 
 # check for in-source build and fail
@@ -67,6 +79,10 @@ endif ()
 if (NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message (FATAL_ERROR "Rippled requires a 64 bit target architecture.\n"
     "The most likely cause of this warning is trying to build rippled with a 32-bit OS.")
+endif ()
+
+if (APPLE AND NOT HOMEBREW)
+  find_program (HOMEBREW brew)
 endif ()
 
 #[===================================================================[
@@ -94,6 +110,15 @@ option (unity "Creates a build based on unity sources. This is the default" ON)
 if (is_gcc OR is_clang)
   option (coverage "Generates coverage info." OFF)
   option (profile "Add profiling flags" OFF)
+  set (coverage_test "" CACHE STRING
+    "On gcc & clang, the specific unit test(s) to run for coverage. Default is all tests.")
+  if (coverage_test AND NOT coverage)
+    set (coverage ON CACHE BOOL "gcc/clang only" FORCE)
+  endif ()
+  option (coverage_core_only
+    "Include only src/ripple files when generating coverage report. \
+    Set to OFF to include all sources in coverage report."
+    ON)
 else ()
   set (profile OFF CACHE BOOL "gcc/clang only" FORCE)
   set (coverage OFF CACHE BOOL "gcc/clang only" FORCE)
@@ -114,6 +139,8 @@ else ()
 endif ()
 option (jemalloc "Enables jemalloc for heap profiling" OFF)
 option (werr "treat warnings as errors" OFF)
+option (local_protobuf
+  "Force use of a local build of protobuf instead of system version." OFF)
 
 # this one is a string and therefore can't be an option
 set (san "" CACHE STRING "On gcc & clang, add sanitizer instrumentation")
@@ -146,19 +173,12 @@ endif ()
 option (beast_no_unit_test_inline
   "Prevents unit test definitions from being inserted into global table"
   OFF)
-option (beast_force_debug
-  "Force BEAST_DEBUG regardless of DEBUG settings"
-  OFF)
 # NOTE - THIS OPTION CURRENTLY DOES NOT COMPILE :
 # TODO: fix or remove
 option (verify_nodeobject_keys
   "This verifies that the hash of node objects matches the payload. \
   This check is expensive - use with caution."
   OFF)
-option (dump_leaks_on_exit
-  "Displays heap blocks and counted objects which were not disposed of\
-  during exit. Only implemented for windows builds."
-  ON)
 option (single_io_service_thread
   "Restricts the number of threads calling io_service::run to one. \
   This can be useful when debugging."
@@ -167,10 +187,6 @@ option (boost_show_deprecated
   "Allow boost to fail on deprecated usage. Only useful if you're trying\
   to find deprecated calls."
   OFF)
-# beast_check_mem_leaks can't be an option() because we want to support an
-# "undefined" which means use default behavior
-# option (beast_check_mem_leaks
-#   "Force beast mem leak checking. Default is on for DEBUG builds. Only implemented on WIN32"
 if (WIN32)
   option (beast_disable_autolink "Disables autolinking of system libraries on WIN32" OFF)
 else ()
@@ -178,7 +194,7 @@ else ()
 endif ()
 if (coverage)
   message (STATUS "coverage build requested - forcing Debug build")
-  set (CMAKE_BUILD_TYPE Debug)
+  set (CMAKE_BUILD_TYPE Debug CACHE STRING "build type" FORCE)
 endif ()
 
 #[===================================================================[
@@ -200,6 +216,12 @@ target_compile_definitions (common
   INTERFACE
     $<$<CONFIG:Debug>:DEBUG _DEBUG>
     $<$<AND:$<BOOL:profile>,$<NOT:$<BOOL:assert>>>:NDEBUG>)
+    # ^^^^ NOTE: CMAKE release builds already have NDEBUG
+    # defined, so no need to add it explicitly except for
+    # this special case of (profile ON) and (assert OFF)
+    # -- presumably this is because we don't want profile
+    # builds asserting unless asserts were specifically
+    # requested
 
 if (MSVC)
   # remove existing exception flag since we set it to -EHa
@@ -207,9 +229,7 @@ if (MSVC)
   # also remove dynamic runtime
   foreach (var_
       CMAKE_C_FLAGS_DEBUG CMAKE_C_FLAGS_RELEASE
-      CMAKE_C_FLAGS_MINSIZEREL CMAKE_C_FLAGS_RELWITHDEBINFO
-      CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE
-      CMAKE_CXX_FLAGS_MINSIZEREL CMAKE_CXX_FLAGS_RELWITHDEBINFO)
+      CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE)
     string (REGEX REPLACE "[-/]MD[d]*" " " ${var_} "${${var_}}")
   endforeach ()
 
@@ -250,6 +270,8 @@ if (MSVC)
       _CRT_SECURE_NO_WARNINGS
       WIN32_CONSOLE
       NOMINMAX
+      # TODO: Resolve these warnings, don't just silence them
+      _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS
       $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Debug>>:_CRTDBG_MAP_ALLOC>)
   target_link_libraries (common
     INTERFACE
@@ -331,13 +353,7 @@ if (is_clang)
 endif()
 
 if (assert)
-  foreach (var_
-      CMAKE_C_FLAGS_RELEASE
-      CMAKE_C_FLAGS_MINSIZEREL
-      CMAKE_C_FLAGS_RELWITHDEBINFO
-      CMAKE_CXX_FLAGS_RELEASE
-      CMAKE_CXX_FLAGS_MINSIZEREL
-      CMAKE_CXX_FLAGS_RELWITHDEBINFO)
+  foreach (var_ CMAKE_C_FLAGS_RELEASE CMAKE_CXX_FLAGS_RELEASE)
     STRING (REGEX REPLACE "[-/]DNDEBUG" "" ${var_} "${${var_}}")
   endforeach ()
 endif ()
@@ -350,7 +366,6 @@ add_library (opts INTERFACE)
 add_library (Ripple::opts ALIAS opts)
 target_compile_definitions (opts
   INTERFACE
-    BOOST_NO_AUTO_PTR
     BOOST_ASIO_HAS_STD_ARRAY
     BOOST_ASIO_DISABLE_HANDLER_TYPE_REQUIREMENTS
     $<$<BOOL:${boost_show_deprecated}>:
@@ -362,10 +377,7 @@ target_compile_definitions (opts
       BOOST_BEAST_ALLOW_DEPRECATED
       BOOST_FILESYSTEM_DEPRECATED
     >
-    BEAST_CHECK_MEMORY_LEAKS=$<BOOL:${beast_check_mem_leaks}>
-    RIPPLE_DUMP_LEAKS_ON_EXIT=$<BOOL:${dump_leaks_on_exit}>
     $<$<BOOL:${beast_no_unit_test_inline}>:BEAST_NO_UNIT_TEST_INLINE=1>
-    $<$<BOOL:${beast_force_debug}>:BEAST_FORCE_DEBUG=1>
     $<$<BOOL:${beast_disable_autolink}>:BEAST_DONT_AUTOLINK_TO_WIN32_LIBRARIES=1>
     $<$<BOOL:${single_io_service_thread}>:RIPPLE_SINGLE_IO_SERVICE_THREAD=1>
     # doesn't currently compile ? :
@@ -374,13 +386,15 @@ target_compile_options (opts
   INTERFACE
     $<$<AND:$<BOOL:${is_gcc}>,$<COMPILE_LANGUAGE:CXX>>:-Wsuggest-override>
     $<$<BOOL:${perf}>:-fno-omit-frame-pointer>
-    $<$<BOOL:${coverage}>:-fprofile-arcs -ftest-coverage>
+    $<$<AND:$<BOOL:${is_gcc}>,$<BOOL:${coverage}>>:-fprofile-arcs -ftest-coverage>
+    $<$<AND:$<BOOL:${is_clang}>,$<BOOL:${coverage}>>:-fprofile-instr-generate -fcoverage-mapping>
     $<$<BOOL:${profile}>:-pg>
     $<$<AND:$<BOOL:${is_gcc}>,$<BOOL:${profile}>>:-p>)
 
 target_link_libraries (opts
   INTERFACE
-    $<$<BOOL:${coverage}>:-fprofile-arcs -ftest-coverage>
+    $<$<AND:$<BOOL:${is_gcc}>,$<BOOL:${coverage}>>:-fprofile-arcs -ftest-coverage>
+    $<$<AND:$<BOOL:${is_clang}>,$<BOOL:${coverage}>>:-fprofile-instr-generate -fcoverage-mapping>
     $<$<BOOL:${profile}>:-pg>
     $<$<AND:$<BOOL:${is_gcc}>,$<BOOL:${profile}>>:-p>)
 
@@ -445,6 +459,40 @@ endif ()
 add_library (ripple_libs INTERFACE)
 add_library (Ripple::libs ALIAS ripple_libs)
 target_link_libraries (ripple_libs INTERFACE Ripple::syslibs)
+
+#[===================================================================[
+   NIH prefix path..this is where we will download
+   and build any ExternalProjects, and they will hopefully
+   survive across build directory deletion (manual cleans)
+#]===================================================================]
+
+string (REGEX REPLACE "[ \\/%]+" "_" gen_for_path ${CMAKE_GENERATOR})
+string (TOLOWER ${gen_for_path} gen_for_path)
+# HACK: trying to shorten paths for windows CI (which hits 260 MAXPATH easily)
+# @see:  https://issues.jenkins-ci.org/browse/JENKINS-38706?focusedCommentId=339847
+string (REPLACE "visual_studio" "vs" gen_for_path ${gen_for_path})
+if (NOT DEFINED NIH_CACHE_ROOT)
+  if (DEFINED ENV{NIH_CACHE_ROOT})
+    set (NIH_CACHE_ROOT $ENV{NIH_CACHE_ROOT})
+  else ()
+    set (NIH_CACHE_ROOT ${CMAKE_SOURCE_DIR})
+  endif ()
+endif ()
+set (nih_cache_path
+  "${NIH_CACHE_ROOT}/.nih_c/${gen_for_path}/${CMAKE_CXX_COMPILER_ID}_${CMAKE_CXX_COMPILER_VERSION}")
+if (NOT is_multiconfig)
+  set (nih_cache_path "${nih_cache_path}/${CMAKE_BUILD_TYPE}")
+endif ()
+file(TO_CMAKE_PATH "${nih_cache_path}" nih_cache_path)
+message (STATUS "NIH-EP cache path: ${nih_cache_path}")
+## two convenience variables:
+set (ep_lib_prefix ${CMAKE_STATIC_LIBRARY_PREFIX})
+set (ep_lib_suffix ${CMAKE_STATIC_LIBRARY_SUFFIX})
+
+# this is a setting for FetchContent and needs to be
+# a cache variable
+# https://cmake.org/cmake/help/latest/module/FetchContent.html#populating-the-content
+set (FETCHCONTENT_BASE_DIR ${nih_cache_path} CACHE STRING "" FORCE)
 
 #[===================================================================[
    NIH dep: boost
@@ -523,19 +571,21 @@ target_link_libraries (ripple_boost
    NIH dep: openssl
 #]===================================================================]
 
-if (APPLE AND NOT DEFINED ENV{OPENSSL_ROOT_DIR})
-  find_program (HOMEBREW brew)
-  if (NOT HOMEBREW STREQUAL "HOMEBREW-NOTFOUND")
+#[===============================================[
+  OPENSSL_ROOT_DIR is the only variable that
+  FindOpenSSL honors for locating, so convert any
+  OPENSSL_ROOT vars to this
+#]===============================================]
+if (NOT DEFINED OPENSSL_ROOT_DIR)
+  if (DEFINED ENV{OPENSSL_ROOT})
+    set (OPENSSL_ROOT_DIR $ENV{OPENSSL_ROOT})
+  elseif (HOMEBREW)
     execute_process (COMMAND ${HOMEBREW} --prefix openssl
       OUTPUT_VARIABLE OPENSSL_ROOT_DIR
       OUTPUT_STRIP_TRAILING_WHITESPACE)
   endif ()
+  file (TO_CMAKE_PATH "${OPENSSL_ROOT_DIR}" OPENSSL_ROOT_DIR)
 endif ()
-
-if ((NOT DEFINED OPENSSL_ROOT) AND (DEFINED ENV{OPENSSL_ROOT}))
-  set (OPENSSL_ROOT $ENV{OPENSSL_ROOT})
-endif ()
-file (TO_CMAKE_PATH "${OPENSSL_ROOT}" OPENSSL_ROOT)
 
 if (static)
   set (OPENSSL_USE_STATIC_LIBS ON)
@@ -564,10 +614,11 @@ set_target_properties(OpenSSL::SSL PROPERTIES
    build option
 #]=========================================================]
 find_package (ZLIB)
+set (has_zlib FALSE)
 if (TARGET ZLIB::ZLIB)
-  #target_link_libraries (OpenSSL::Crypto INTERFACE ZLIB::ZLIB)
   set_target_properties(OpenSSL::Crypto PROPERTIES
     INTERFACE_LINK_LIBRARIES ZLIB::ZLIB)
+  set (has_zlib TRUE)
 endif ()
 
 #[===================================================================[
@@ -639,59 +690,93 @@ install (
    NIH dep: lz4
 #]===================================================================]
 
-add_library (lz4 STATIC
-  src/lz4/lib/lz4.c
-  src/lz4/lib/lz4hc.c
-  src/lz4/lib/lz4frame.c
-  src/lz4/lib/xxhash.c)
-target_compile_definitions (lz4
-  PRIVATE XXH_NAMESPACE=LZ4_)
-add_library (NIH::lz4 ALIAS lz4)
-target_link_libraries (ripple_libs INTERFACE NIH::lz4)
-## pseudo-install our files so that dependent builds can find them
-file (MAKE_DIRECTORY
-    ${CMAKE_BINARY_DIR}/lz4/include
-    ${CMAKE_BINARY_DIR}/lz4/lib)
-target_include_directories (lz4 PUBLIC ${CMAKE_BINARY_DIR}/lz4/include)
-add_custom_command (TARGET lz4 POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/lz4/lib/lz4.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/lz4/lib/lz4frame.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/lz4/lib/lz4hc.h
-    ${CMAKE_BINARY_DIR}/lz4/include
-  COMMAND ${CMAKE_COMMAND} -E copy
-    $<TARGET_FILE:lz4> ${CMAKE_BINARY_DIR}/lz4/lib)
+ExternalProject_Add (lz4
+  PREFIX ${nih_cache_path}
+  GIT_REPOSITORY https://github.com/lz4/lz4.git
+  GIT_TAG v1.8.2
+  SOURCE_SUBDIR contrib/cmake_unofficial
+  CMAKE_ARGS
+    -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+    -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+    $<$<BOOL:${CMAKE_VERBOSE_MAKEFILE}>:-DCMAKE_VERBOSE_MAKEFILE=ON>
+    -DCMAKE_DEBUG_POSTFIX=_d
+    $<$<NOT:$<BOOL:${is_multiconfig}>>:-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}>
+    -DBUILD_STATIC_LIBS=ON
+    -DBUILD_SHARED_LIBS=OFF
+    $<$<BOOL:${MSVC}>:
+      "-DCMAKE_C_FLAGS=-GR -Gd -fp:precise -FS -MP"
+      "-DCMAKE_C_FLAGS_DEBUG=-MTd"
+      "-DCMAKE_C_FLAGS_RELEASE=-MT"
+    >
+  LOG_BUILD ON
+  LOG_CONFIGURE ON
+  BUILD_COMMAND
+    ${CMAKE_COMMAND}
+    --build .
+    --config $<CONFIG>
+    --target lz4_static
+    $<$<VERSION_GREATER_EQUAL:${CMAKE_VERSION},3.12>:--parallel$<$<BOOL:${is_xcode}>: ${num_procs}>>
+    $<$<BOOL:${is_multiconfig}>:
+      COMMAND
+        ${CMAKE_COMMAND} -E copy
+        <BINARY_DIR>/$<CONFIG>/${ep_lib_prefix}lz4$<$<CONFIG:Debug>:_d>${ep_lib_suffix}
+        <BINARY_DIR>
+      >
+  TEST_COMMAND ""
+  INSTALL_COMMAND ""
+  BUILD_BYPRODUCTS
+    <BINARY_DIR>/${ep_lib_prefix}lz4${ep_lib_suffix}
+    <BINARY_DIR>/${ep_lib_prefix}lz4_d${ep_lib_suffix}
+)
+ExternalProject_Get_Property (lz4 BINARY_DIR)
+ExternalProject_Get_Property (lz4 SOURCE_DIR)
+ExternalProject_Get_Property (lz4 STAMP_DIR)
+if (CMAKE_VERBOSE_MAKEFILE)
+  print_ep_logs (lz4)
+endif ()
+add_library (lz4_lib STATIC IMPORTED GLOBAL)
+file (MAKE_DIRECTORY ${SOURCE_DIR}/lz4)
+set_target_properties (lz4_lib PROPERTIES
+  IMPORTED_LOCATION_DEBUG
+    ${BINARY_DIR}/${ep_lib_prefix}lz4_d${ep_lib_suffix}
+  IMPORTED_LOCATION_RELEASE
+    ${BINARY_DIR}/${ep_lib_prefix}lz4${ep_lib_suffix}
+  INTERFACE_INCLUDE_DIRECTORIES
+    ${SOURCE_DIR}/lib)
+add_dependencies (lz4_lib lz4)
+target_link_libraries (ripple_libs INTERFACE lz4_lib)
 exclude_if_included (lz4)
+exclude_if_included (lz4_lib)
 
 #[===================================================================[
-   NIH dep: libarchive (via external project)
+   NIH dep: libarchive
 #]===================================================================]
-set (la_root_suffix)
+
+set (lib_post "")
 if (MSVC)
-  set(la_root_suffix "_static")
+  set (lib_post "_static")
 endif ()
-string(REGEX REPLACE "[ \\/%]+" "_" gen_for_path ${CMAKE_GENERATOR})
-string(TOLOWER ${gen_for_path} gen_for_path)
-# hack: trying to shorten paths for windows CI (hits 260 MAXPATH easily)
-string(REPLACE "visual_studio" "vs" gen_for_path ${gen_for_path})
 ExternalProject_Add (libarchive
-  PREFIX ${CMAKE_SOURCE_DIR}/.nih_c/${gen_for_path}/${CMAKE_CXX_COMPILER_ID}_${CMAKE_CXX_COMPILER_VERSION}
-  # TODO: switch back to official repo once they allow ENABLE_WERROR option in
-  # mainline -- see https://github.com/libarchive/libarchive/pull/1033
-  #GIT_REPOSITORY https://github.com/libarchive/libarchive.git
-  #GIT_TAG v3.3.1
-  GIT_REPOSITORY https://github.com/mellery451/libarchive.git
-  GIT_TAG e78e48ea4e102fef7f379bc8f10afbfbf25633a6
+  PREFIX ${nih_cache_path}
+  GIT_REPOSITORY https://github.com/libarchive/libarchive.git
+  GIT_TAG v3.3.3
   CMAKE_ARGS
     # passing the compiler seems to be needed for windows CI, sadly
     -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
     -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
     $<$<BOOL:${CMAKE_VERBOSE_MAKEFILE}>:-DCMAKE_VERBOSE_MAKEFILE=ON>
-    -DCMAKE_PREFIX_PATH=${CMAKE_BINARY_DIR}/lz4
     -DCMAKE_DEBUG_POSTFIX=_d
-    -DCMAKE_BUILD_TYPE=$<IF:$<STREQUAL:${CMAKE_BUILD_TYPE},Debug>,Debug,Release>
+    $<$<NOT:$<BOOL:${is_multiconfig}>>:-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}>
     -DENABLE_LZ4=ON
     -ULZ4_*
+    -DLZ4_INCLUDE_DIR=$<TARGET_PROPERTY:lz4_lib,INTERFACE_INCLUDE_DIRECTORIES>
+    # because we are building a static lib, this lz4 library doesn't
+    # actually matter since you can't generally link static libs to other static
+    # libs. The include files are needed, but the library itself is not (until
+    # we link our application, at which point we use the lz4 we built above).
+    # nonetheless, we need to provide a library to libarchive else it will
+    # NOT include lz4 support when configuring
+    -DLZ4_LIBRARY=$<IF:$<CONFIG:Debug>,$<TARGET_PROPERTY:lz4_lib,IMPORTED_LOCATION_DEBUG>,$<TARGET_PROPERTY:lz4_lib,IMPORTED_LOCATION_RELEASE>>
     -DENABLE_WERROR=OFF
     -DENABLE_TAR=OFF
     -DENABLE_TAR_SHARED=OFF
@@ -720,8 +805,6 @@ ExternalProject_Add (libarchive
       "-DCMAKE_C_FLAGS=-GR -Gd -fp:precise -FS -MP"
       "-DCMAKE_C_FLAGS_DEBUG=-MTd"
       "-DCMAKE_C_FLAGS_RELEASE=-MT"
-      "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-MT"
-      "-DCMAKE_C_FLAGS_MINSIZEREL=-MT"
     >
   LOG_BUILD ON
   LOG_CONFIGURE ON
@@ -730,148 +813,285 @@ ExternalProject_Add (libarchive
     --build .
     --config $<CONFIG>
     --target archive_static
+    $<$<VERSION_GREATER_EQUAL:${CMAKE_VERSION},3.12>:--parallel$<$<BOOL:${is_xcode}>: ${num_procs}>>
     $<$<BOOL:${is_multiconfig}>:
       COMMAND
         ${CMAKE_COMMAND} -E copy
-       <BINARY_DIR>/libarchive/$<CONFIG>/${CMAKE_STATIC_LIBRARY_PREFIX}archive${la_root_suffix}$<$<OR:$<CONFIG:Debug>,$<CONFIG:DebugClassic>>:_d>${CMAKE_STATIC_LIBRARY_SUFFIX}
-        <BINARY_DIR>/libarchive
+          <BINARY_DIR>/libarchive/$<CONFIG>/${ep_lib_prefix}archive${lib_post}$<$<CONFIG:Debug>:_d>${ep_lib_suffix}
+          <BINARY_DIR>/libarchive
       >
   TEST_COMMAND ""
   INSTALL_COMMAND ""
   DEPENDS lz4
   BUILD_BYPRODUCTS
-    <BINARY_DIR>/libarchive/${CMAKE_STATIC_LIBRARY_PREFIX}archive${la_root_suffix}${CMAKE_STATIC_LIBRARY_SUFFIX}
-    <BINARY_DIR>/libarchive/${CMAKE_STATIC_LIBRARY_PREFIX}archive${la_root_suffix}_d${CMAKE_STATIC_LIBRARY_SUFFIX}
+    <BINARY_DIR>/libarchive/${ep_lib_prefix}archive${lib_post}${ep_lib_suffix}
+    <BINARY_DIR>/libarchive/${ep_lib_prefix}archive${lib_post}_d${ep_lib_suffix}
 )
 ExternalProject_Get_Property (libarchive BINARY_DIR)
 ExternalProject_Get_Property (libarchive SOURCE_DIR)
+ExternalProject_Get_Property (libarchive STAMP_DIR)
+if (CMAKE_VERBOSE_MAKEFILE)
+  print_ep_logs (libarchive)
+endif ()
 add_library (archive_lib STATIC IMPORTED GLOBAL)
 file (MAKE_DIRECTORY ${SOURCE_DIR}/libarchive)
 set_target_properties (archive_lib PROPERTIES
   IMPORTED_LOCATION_DEBUG
-    ${BINARY_DIR}/libarchive/${CMAKE_STATIC_LIBRARY_PREFIX}archive${la_root_suffix}_d${CMAKE_STATIC_LIBRARY_SUFFIX}
+    ${BINARY_DIR}/libarchive/${ep_lib_prefix}archive${lib_post}_d${ep_lib_suffix}
   IMPORTED_LOCATION_RELEASE
-    ${BINARY_DIR}/libarchive/${CMAKE_STATIC_LIBRARY_PREFIX}archive${la_root_suffix}${CMAKE_STATIC_LIBRARY_SUFFIX}
-  INTERFACE_INCLUDE_DIRECTORIES ${SOURCE_DIR}/libarchive
-  INTERFACE_COMPILE_DEFINITIONS LIBARCHIVE_STATIC)
+    ${BINARY_DIR}/libarchive/${ep_lib_prefix}archive${lib_post}${ep_lib_suffix}
+  INTERFACE_INCLUDE_DIRECTORIES
+    ${SOURCE_DIR}/libarchive
+  INTERFACE_COMPILE_DEFINITIONS
+    LIBARCHIVE_STATIC)
 add_dependencies (archive_lib libarchive)
-target_link_libraries (archive_lib INTERFACE NIH::lz4)
+target_link_libraries (archive_lib INTERFACE lz4_lib)
 target_link_libraries (ripple_libs INTERFACE archive_lib)
+exclude_if_included (libarchive)
+exclude_if_included (archive_lib)
 
 #[===================================================================[
    NIH dep: sqlite
 #]===================================================================]
 
-add_library (sqlite3 STATIC
-  src/sqlite/sqlite/sqlite3.c)
-#[=========================================================[
-   When compiled with SQLITE_THREADSAFE=1, SQLite operates
-   in serialized mode. In this mode, SQLite can be safely
-   used by multiple threads with no restriction.
-
-   VFALCO NOTE: This implies a global mutex!
-
-   When compiled with SQLITE_THREADSAFE=2, SQLite can be
-   used in a multithreaded program so long as no two
-   threads attempt to use the same database connection at
-   the same time.
-
-   VFALCO NOTE: This is the preferred threading model.
-#]=========================================================]
-target_compile_definitions (sqlite3
-  PRIVATE
-    SQLITE_THREADSAFE=1
-    HAVE_USLEEP=1)
-target_compile_options (sqlite3
-  PRIVATE
+ExternalProject_Add (sqlite3
+  PREFIX ${nih_cache_path}
+  # sqlite doesn't use git, but it provides versioned tarballs
+  URL https://www.sqlite.org/2018/sqlite-amalgamation-3260000.zip
+  # ^^^ version is apparent in the URL:  3260000 => 3.26.0
+  URL_HASH SHA256=de5dcab133aa339a4cf9e97c40aa6062570086d6085d8f9ad7bc6ddf8a52096e
+  # we wrote a very simple CMake file to build sqlite
+  # so that's what we copy here so that we can build with
+  # CMake. sqlite doesn't generally provided a build system
+  # for the single amalgamation source file.
+  PATCH_COMMAND
+    ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_SOURCE_DIR}/Builds/CMake/CMake_sqlite3.txt
+    <SOURCE_DIR>/CMakeLists.txt
+  CMAKE_ARGS
+    -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+    -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+    $<$<BOOL:${CMAKE_VERBOSE_MAKEFILE}>:-DCMAKE_VERBOSE_MAKEFILE=ON>
+    -DCMAKE_DEBUG_POSTFIX=_d
+    $<$<NOT:$<BOOL:${is_multiconfig}>>:-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}>
     $<$<BOOL:${MSVC}>:
-      -wd4100
-      -wd4127
-      -wd4232
-      -wd4244
-      -wd4701
-      -wd4706
-      -wd4996
+      "-DCMAKE_C_FLAGS=-GR -Gd -fp:precise -FS -MP"
+      "-DCMAKE_C_FLAGS_DEBUG=-MTd"
+      "-DCMAKE_C_FLAGS_RELEASE=-MT"
     >
-    $<$<NOT:$<BOOL:${MSVC}>>:-Wno-array-bounds>)
-add_library (NIH::sqlite3 ALIAS sqlite3)
-target_link_libraries (sqlite3 PUBLIC $<$<NOT:$<BOOL:${MSVC}>>:dl>)
-target_link_libraries (ripple_libs INTERFACE NIH::sqlite3)
-file (MAKE_DIRECTORY
-    ${CMAKE_BINARY_DIR}/sqlite3/include
-    ${CMAKE_BINARY_DIR}/sqlite3/lib)
-target_include_directories (sqlite3
-  PRIVATE
-    src/sqlite
-    src/sqlite/sqlite
-  INTERFACE
-    ${CMAKE_BINARY_DIR}/sqlite3/include)
-add_custom_command (TARGET sqlite3 POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_directory
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/sqlite/sqlite ${CMAKE_BINARY_DIR}/sqlite3/include
-  COMMAND ${CMAKE_COMMAND} -E copy
-    $<TARGET_FILE:sqlite3> ${CMAKE_BINARY_DIR}/sqlite3/lib
-  BYPRODUCTS ${CMAKE_BINARY_DIR}/sqlite3/include/sqlite3.h)
+  LOG_BUILD ON
+  LOG_CONFIGURE ON
+  BUILD_COMMAND
+    ${CMAKE_COMMAND}
+    --build .
+    --config $<CONFIG>
+    $<$<VERSION_GREATER_EQUAL:${CMAKE_VERSION},3.12>:--parallel$<$<BOOL:${is_xcode}>: ${num_procs}>>
+    $<$<BOOL:${is_multiconfig}>:
+      COMMAND
+        ${CMAKE_COMMAND} -E copy
+          <BINARY_DIR>/$<CONFIG>/${ep_lib_prefix}sqlite3$<$<CONFIG:Debug>:_d>${ep_lib_suffix}
+          <BINARY_DIR>
+      >
+  TEST_COMMAND ""
+  INSTALL_COMMAND ""
+  BUILD_BYPRODUCTS
+    <BINARY_DIR>/${ep_lib_prefix}sqlite3${ep_lib_suffix}
+    <BINARY_DIR>/${ep_lib_prefix}sqlite3_d${ep_lib_suffix}
+)
+ExternalProject_Get_Property (sqlite3 BINARY_DIR)
+ExternalProject_Get_Property (sqlite3 SOURCE_DIR)
+ExternalProject_Get_Property (sqlite3 STAMP_DIR)
+if (CMAKE_VERBOSE_MAKEFILE)
+  print_ep_logs (sqlite3)
+endif ()
+add_library (sqlite STATIC IMPORTED GLOBAL)
+set_target_properties (sqlite PROPERTIES
+  IMPORTED_LOCATION_DEBUG
+    ${BINARY_DIR}/${ep_lib_prefix}sqlite3_d${ep_lib_suffix}
+  IMPORTED_LOCATION_RELEASE
+    ${BINARY_DIR}/${ep_lib_prefix}sqlite3${ep_lib_suffix}
+  INTERFACE_INCLUDE_DIRECTORIES
+    ${SOURCE_DIR})
+add_dependencies (sqlite sqlite3)
+target_link_libraries (sqlite INTERFACE $<$<NOT:$<BOOL:${MSVC}>>:dl>)
+target_link_libraries (ripple_libs INTERFACE sqlite)
 exclude_if_included (sqlite3)
+exclude_if_included (sqlite)
+set(sqlite_BINARY_DIR ${BINARY_DIR})
 
 #[===================================================================[
    NIH dep: soci
 #]===================================================================]
 
-add_library (soci STATIC
-  #[=========================================================[
-     this unity file is our interpretation of
-     what sources constitute soci-lib.
-  #]=========================================================]
-  src/ripple/unity/soci.cpp
-  # this header is here to create dependency on the sqlite post-build step
-  ${CMAKE_BINARY_DIR}/sqlite3/include/sqlite3.h)
-target_compile_definitions (soci PUBLIC SOCI_HAVE_CXX_C11=1)
-target_include_directories (soci
-  PUBLIC
-    src/soci/src
-    src/soci/include
-    #[=========================================================[
-       HACK for ninja..which doesn't properly see
-       the POST_BUILD dependency on sqlite (TODO: diagnose)
-       so we must include the original source dir
-    #]=========================================================]
-    $<$<STREQUAL:${CMAKE_GENERATOR},Ninja>:
-      ${CMAKE_CURRENT_SOURCE_DIR}/src/sqlite
+set (soci_lib_pre ${ep_lib_prefix})
+set (soci_lib_post "")
+if (WIN32)
+  # for some reason soci on windows still prepends lib (non-standard)
+  set (soci_lib_pre lib)
+  # this version in the name might change if/when we change versions of soci
+  set (soci_lib_post "_4_0")
+endif ()
+ExternalProject_Add (soci
+  PREFIX ${nih_cache_path}
+  GIT_REPOSITORY https://github.com/SOCI/soci.git
+  GIT_TAG 3a1f602b3021b925d38828e3ff95f9e7f8887ff7
+  # We had an issue with soci integer range checking for boost::optional
+  # and needed to remove the exception that SOCI throws in this case.
+  # This is *probably* a bug in SOCI, but has never been investigated more
+  # nor reported to the maintainers.
+  # This cmake script comments out the lines in question.
+  # This patch process is likely fragile and should be reviewed carefully
+  # whenever we update the GIT_TAG above.
+  PATCH_COMMAND
+    ${CMAKE_COMMAND} -P ${CMAKE_SOURCE_DIR}/Builds/CMake/soci_patch.cmake
+  CMAKE_ARGS
+    -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+    -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+    $<$<BOOL:${CMAKE_VERBOSE_MAKEFILE}>:-DCMAKE_VERBOSE_MAKEFILE=ON>
+    -DCMAKE_PREFIX_PATH=${CMAKE_BINARY_DIR}/sqlite3
+    -DCMAKE_INCLUDE_PATH=$<TARGET_PROPERTY:sqlite,INTERFACE_INCLUDE_DIRECTORIES>
+    -DCMAKE_LIBRARY_PATH=${sqlite_BINARY_DIR}
+    -DCMAKE_DEBUG_POSTFIX=_d
+    $<$<NOT:$<BOOL:${is_multiconfig}>>:-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}>
+    -DSOCI_CXX_C11=ON
+    -DSOCI_STATIC=ON
+    -DSOCI_LIBDIR=lib
+    -DSOCI_SHARED=OFF
+    -DSOCI_TESTS=OFF
+    -DBOOST_ROOT=${Boost_DIR}
+    -DWITH_BOOST=ON
+    -DSOCI_DB2=OFF
+    -DSOCI_FIREBIRD=OFF
+    -DSOCI_MYSQL=OFF
+    -DSOCI_ODBC=OFF
+    -DSOCI_ORACLE=OFF
+    -DSOCI_POSTGRESQL=OFF
+    -DSOCI_SQLITE3=ON
+    -DSQLITE3_INCLUDE_DIR=$<TARGET_PROPERTY:sqlite,INTERFACE_INCLUDE_DIRECTORIES>
+    -DSQLITE3_LIBRARY=$<IF:$<CONFIG:Debug>,$<TARGET_PROPERTY:sqlite,IMPORTED_LOCATION_DEBUG>,$<TARGET_PROPERTY:sqlite,IMPORTED_LOCATION_RELEASE>>
+    $<$<BOOL:${APPLE}>:-DCMAKE_FIND_FRAMEWORK=LAST>
+    $<$<BOOL:${MSVC}>:
+      "-DCMAKE_CXX_FLAGS=-GR -Gd -fp:precise -FS -EHa -MP"
+      "-DCMAKE_CXX_FLAGS_DEBUG=-MTd"
+      "-DCMAKE_CXX_FLAGS_RELEASE=-MT"
     >
-  PRIVATE
-    src
-    src/soci/src/core
-    src/soci/include/private)
-target_link_libraries (soci
-  NIH::sqlite3
-  Ripple::boost)
-add_library (NIH::soci ALIAS soci)
-target_link_libraries (ripple_libs INTERFACE NIH::soci)
+    $<$<NOT:$<BOOL:${MSVC}>>:
+      "-DCMAKE_CXX_FLAGS=-Wno-deprecated-declarations"
+    >
+    # SEE: https://github.com/SOCI/soci/issues/640
+    $<$<AND:$<BOOL:${is_gcc}>,$<VERSION_GREATER_EQUAL:${CMAKE_CXX_COMPILER_VERSION},8>>:
+      "-DCMAKE_CXX_FLAGS=-Wno-deprecated-declarations -Wno-error=format-overflow -Wno-format-overflow -Wno-error=format-truncation"
+    >
+  LOG_BUILD ON
+  LOG_CONFIGURE ON
+  BUILD_COMMAND
+    ${CMAKE_COMMAND}
+    --build .
+    --config $<CONFIG>
+    $<$<VERSION_GREATER_EQUAL:${CMAKE_VERSION},3.12>:--parallel$<$<BOOL:${is_xcode}>: ${num_procs}>>
+    $<$<BOOL:${is_multiconfig}>:
+      COMMAND
+        ${CMAKE_COMMAND} -E copy
+        <BINARY_DIR>/lib/$<CONFIG>/${soci_lib_pre}soci_core${soci_lib_post}$<$<CONFIG:Debug>:_d>${ep_lib_suffix}
+        <BINARY_DIR>/lib/$<CONFIG>/${soci_lib_pre}soci_empty${soci_lib_post}$<$<CONFIG:Debug>:_d>${ep_lib_suffix}
+        <BINARY_DIR>/lib/$<CONFIG>/${soci_lib_pre}soci_sqlite3${soci_lib_post}$<$<CONFIG:Debug>:_d>${ep_lib_suffix}
+        <BINARY_DIR>/lib
+      >
+  TEST_COMMAND ""
+  INSTALL_COMMAND ""
+  DEPENDS sqlite3
+  BUILD_BYPRODUCTS
+    <BINARY_DIR>/lib/${soci_lib_pre}soci_core${soci_lib_post}${ep_lib_suffix}
+    <BINARY_DIR>/lib/${soci_lib_pre}soci_core${soci_lib_post}_d${ep_lib_suffix}
+    <BINARY_DIR>/lib/${soci_lib_pre}soci_empty${soci_lib_post}${ep_lib_suffix}
+    <BINARY_DIR>/lib/${soci_lib_pre}soci_empty${soci_lib_post}_d${ep_lib_suffix}
+    <BINARY_DIR>/lib/${soci_lib_pre}soci_sqlite3${soci_lib_post}${ep_lib_suffix}
+    <BINARY_DIR>/lib/${soci_lib_pre}soci_sqlite3${soci_lib_post}_d${ep_lib_suffix}
+)
+ExternalProject_Get_Property (soci BINARY_DIR)
+ExternalProject_Get_Property (soci SOURCE_DIR)
+if (CMAKE_VERBOSE_MAKEFILE)
+  print_ep_logs (soci)
+endif ()
+file (MAKE_DIRECTORY ${SOURCE_DIR}/include)
+file (MAKE_DIRECTORY ${BINARY_DIR}/include)
+foreach (_comp core empty sqlite3)
+  add_library ("soci_${_comp}" STATIC IMPORTED GLOBAL)
+  set_target_properties ("soci_${_comp}" PROPERTIES
+    IMPORTED_LOCATION_DEBUG
+      ${BINARY_DIR}/lib/${soci_lib_pre}soci_${_comp}${soci_lib_post}_d${ep_lib_suffix}
+    IMPORTED_LOCATION_RELEASE
+      ${BINARY_DIR}/lib/${soci_lib_pre}soci_${_comp}${soci_lib_post}${ep_lib_suffix}
+    INTERFACE_INCLUDE_DIRECTORIES
+      "${SOURCE_DIR}/include;${BINARY_DIR}/include")
+  add_dependencies ("soci_${_comp}" soci) # something has to depend on the ExternalProject to trigger it
+  target_link_libraries (ripple_libs INTERFACE "soci_${_comp}")
+  if (NOT _comp STREQUAL "core")
+    target_link_libraries ("soci_${_comp}" INTERFACE soci_core)
+  endif ()
+  exclude_if_included ("soci_${_comp}")
+endforeach ()
 exclude_if_included (soci)
 
 #[===================================================================[
    NIH dep: snappy
 #]===================================================================]
 
-add_library (snappy STATIC
-  src/snappy/snappy/snappy.cc
-  src/snappy/snappy/snappy-sinksource.cc
-  src/snappy/snappy/snappy-stubs-internal.cc)
-target_compile_options (snappy
-  PRIVATE
-    $<$<NOT:$<BOOL:${MSVC}>>:
-      -Wno-deprecated
-      -Wno-unused-function
+ExternalProject_Add (snappy
+  PREFIX ${nih_cache_path}
+  GIT_REPOSITORY https://github.com/google/snappy.git
+  GIT_TAG 1.1.7
+  CMAKE_ARGS
+    -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+    -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+    $<$<BOOL:${CMAKE_VERBOSE_MAKEFILE}>:-DCMAKE_VERBOSE_MAKEFILE=ON>
+    -DCMAKE_DEBUG_POSTFIX=_d
+    $<$<NOT:$<BOOL:${is_multiconfig}>>:-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}>
+    -DBUILD_SHARED_LIBS=OFF
+    -DSNAPPY_BUILD_TESTS=OFF
+    $<$<BOOL:${MSVC}>:
+      "-DCMAKE_C_FLAGS=-GR -Gd -fp:precise -FS -MP"
+      "-DCMAKE_C_FLAGS_DEBUG=-MTd"
+      "-DCMAKE_C_FLAGS_RELEASE=-MT"
     >
-    $<$<BOOL:${is_gcc}>:-Wno-nonnull-compare>)
-target_include_directories (snappy
-  PUBLIC
-    src/snappy/snappy
-    src/snappy/config)
-add_library (NIH::snappy ALIAS snappy)
-target_link_libraries (ripple_libs INTERFACE NIH::snappy)
+  LOG_BUILD ON
+  LOG_CONFIGURE ON
+  BUILD_COMMAND
+    ${CMAKE_COMMAND}
+    --build .
+    --config $<CONFIG>
+    $<$<VERSION_GREATER_EQUAL:${CMAKE_VERSION},3.12>:--parallel$<$<BOOL:${is_xcode}>: ${num_procs}>>
+    $<$<BOOL:${is_multiconfig}>:
+      COMMAND
+        ${CMAKE_COMMAND} -E copy
+        <BINARY_DIR>/$<CONFIG>/${ep_lib_prefix}snappy$<$<CONFIG:Debug>:_d>${ep_lib_suffix}
+        <BINARY_DIR>
+      >
+  TEST_COMMAND ""
+  INSTALL_COMMAND ""
+  BUILD_BYPRODUCTS
+    <BINARY_DIR>/${ep_lib_prefix}snappy${ep_lib_suffix}
+    <BINARY_DIR>/${ep_lib_prefix}snappy_d${ep_lib_suffix}
+)
+ExternalProject_Get_Property (snappy BINARY_DIR)
+ExternalProject_Get_Property (snappy SOURCE_DIR)
+ExternalProject_Get_Property (snappy STAMP_DIR)
+if (CMAKE_VERBOSE_MAKEFILE)
+  print_ep_logs (snappy)
+endif ()
+add_library (snappy_lib STATIC IMPORTED GLOBAL)
+file (MAKE_DIRECTORY ${SOURCE_DIR}/snappy)
+set_target_properties (snappy_lib PROPERTIES
+  IMPORTED_LOCATION_DEBUG
+    ${BINARY_DIR}/${ep_lib_prefix}snappy_d${ep_lib_suffix}
+  IMPORTED_LOCATION_RELEASE
+    ${BINARY_DIR}/${ep_lib_prefix}snappy${ep_lib_suffix}
+  INTERFACE_INCLUDE_DIRECTORIES
+    "${SOURCE_DIR};${BINARY_DIR}")
+add_dependencies (snappy_lib snappy)
+target_link_libraries (ripple_libs INTERFACE snappy_lib)
 exclude_if_included (snappy)
+exclude_if_included (snappy_lib)
 
 #[===================================================================[
    NIH dep: rocksdb
@@ -888,7 +1108,7 @@ if (NOT MSVC)
     PRIVATE
       $<$<BOOL:${is_gcc}>:-w>
     PUBLIC
-      $<$<AND:$<CXX_COMPILER_ID:Clang>,$<VERSION_GREATER_EQUAL:CMAKE_CXX_COMPILER_VERSION,7>>:
+      $<$<AND:$<CXX_COMPILER_ID:Clang>,$<VERSION_GREATER_EQUAL:$<CXX_COMPILER_VERSION>,7>>:
         -Wno-inconsistent-missing-override
         -Wno-uninitialized
       >
@@ -911,25 +1131,54 @@ if (NOT MSVC)
       $<$<BOOL:${APPLE}>:OS_MACOSX=1>
       $<$<PLATFORM_ID:Linux>:OS_LINUX>
     )
-  target_link_libraries (rocksdb NIH::snappy)
+  target_link_libraries (rocksdb snappy_lib)
+  exclude_if_included (rocksdb)
 else ()
   add_library (rocksdb INTERFACE)
   target_compile_definitions (rocksdb INTERFACE RIPPLE_ROCKSDB_AVAILABLE=0)
 endif ()
 add_library (NIH::rocksdb ALIAS rocksdb)
 target_link_libraries (ripple_libs INTERFACE NIH::rocksdb)
-exclude_if_included (rocksdb)
 
 #[===================================================================[
    NIH dep: nudb
 
    NuDB is header-only, thus is an INTERFACE lib in CMake.
-   TODO: move this into NuDB repo, add proper targets and
-   export/install
+   TODO: move the library definition into NuDB repo and add
+   proper targets and export/install
 #]===================================================================]
 
 add_library (nudb INTERFACE)
-target_include_directories (nudb INTERFACE src/nudb/include)
+if (CMAKE_VERSION VERSION_GREATER_EQUAL 3.11)
+  FetchContent_Declare(
+    nudb_src
+    GIT_REPOSITORY https://github.com/vinniefalco/NuDB.git
+    GIT_TAG        1.0.0
+  )
+  FetchContent_GetProperties(nudb_src)
+  if(NOT nudb_src_POPULATED)
+    message (STATUS "Pausing to download NuDB...")
+    FetchContent_Populate(nudb_src)
+  endif()
+else ()
+  ExternalProject_Add (nudb_src
+    PREFIX ${nih_cache_path}
+    GIT_REPOSITORY https://github.com/vinniefalco/NuDB.git
+    GIT_TAG 1.0.0
+    CONFIGURE_COMMAND ""
+    BUILD_COMMAND ""
+    TEST_COMMAND ""
+    INSTALL_COMMAND ""
+  )
+  ExternalProject_Get_Property (nudb_src SOURCE_DIR)
+  set (nudb_src_SOURCE_DIR "${SOURCE_DIR}")
+  file (MAKE_DIRECTORY ${nudb_src_SOURCE_DIR}/include)
+  add_dependencies (nudb nudb_src)
+endif ()
+
+file(TO_CMAKE_PATH "${nudb_src_SOURCE_DIR}" nudb_src_SOURCE_DIR)
+# specify as system includes so as to avoid warnings
+target_include_directories (nudb SYSTEM INTERFACE ${nudb_src_SOURCE_DIR}/include)
 target_link_libraries (nudb
   INTERFACE
     Boost::thread
@@ -939,35 +1188,103 @@ target_link_libraries (ripple_libs INTERFACE NIH::nudb)
 
 #[===================================================================[
    import protobuf (lib and compiler) and create a lib
-   from our proto message definitions. There is fallback
-   logic for windows that builds some version of the protobuf
-   core library from source and downloads the protoc compiler
-   if needed
+   from our proto message definitions. If the system protobuf
+   is not found, fallback on EP to download and build a version
+   from official source.
 #]===================================================================]
 
 if (static)
   set (Protobuf_USE_STATIC_LIBS ON)
 endif ()
 find_package (Protobuf)
-if (MSVC AND NOT TARGET protobuf::protoc)
-  find_program (my_protoc NAMES protoc)
-  if (NOT my_protoc)
-    message (WARNING "No protoc found -- downloading now")
-    file (DOWNLOAD
-      "https://ripple.github.io/Downloads/protoc/2.5.1/protoc.exe"
-      ${CMAKE_BINARY_DIR}/tools/protoc.exe
-      STATUS status
-      TIMEOUT 30)
-    list (GET status 0 status_code)
-    list (GET status 1 status_string)
-    if (NOT status_code EQUAL 0)
-      message (FATAL_ERROR "Failed to download protoc: ${status_string}")
-    endif ()
-    set (my_protoc ${CMAKE_BINARY_DIR}/tools/protoc.exe)
+if (local_protobuf OR NOT TARGET protobuf::libprotobuf)
+  message (STATUS "using local protobuf build.")
+  if (WIN32)
+    # protobuf prepends lib even on windows
+    set (pbuf_lib_pre "lib")
+  else ()
+    set (pbuf_lib_pre ${ep_lib_prefix})
   endif ()
-  add_executable (protobuf::protoc IMPORTED)
+  # for the external project build of protobuf, we currently ignore the
+  # static option and always build static libs here. This is consistent
+  # with our other EP builds. Dynamic libs in an EP would add complexity
+  # because we'd need to get them into the runtime path, and probably
+  # install them.
+  ExternalProject_Add (protobuf_src
+    PREFIX ${nih_cache_path}
+    GIT_REPOSITORY https://github.com/protocolbuffers/protobuf.git
+    GIT_TAG v3.6.1
+    SOURCE_SUBDIR cmake
+    CMAKE_ARGS
+      -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+      -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+      -Dprotobuf_BUILD_TESTS=OFF
+      -Dprotobuf_BUILD_EXAMPLES=OFF
+      -Dprotobuf_BUILD_PROTOC_BINARIES=ON
+      -Dprotobuf_MSVC_STATIC_RUNTIME=ON
+      -DBUILD_SHARED_LIBS=OFF
+      -Dprotobuf_BUILD_SHARED_LIBS=OFF
+      -DCMAKE_DEBUG_POSTFIX=_d
+      -Dprotobuf_DEBUG_POSTFIX=_d
+      -Dprotobuf_WITH_ZLIB=$<IF:$<BOOL:${has_zlib}>,ON,OFF>
+      $<$<BOOL:${CMAKE_VERBOSE_MAKEFILE}>:-DCMAKE_VERBOSE_MAKEFILE=ON>
+      $<$<NOT:$<BOOL:${is_multiconfig}>>:-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}>
+      $<$<BOOL:${MSVC}>:
+	"-DCMAKE_CXX_FLAGS=-GR -Gd -fp:precise -FS -EHa -MP"
+      >
+    LOG_BUILD ON
+    LOG_CONFIGURE ON
+    BUILD_COMMAND
+      ${CMAKE_COMMAND}
+      --build .
+      --config $<CONFIG>
+      $<$<VERSION_GREATER_EQUAL:${CMAKE_VERSION},3.12>:--parallel$<$<BOOL:${is_xcode}>: ${num_procs}>>
+      $<$<BOOL:${is_multiconfig}>:
+        COMMAND
+          ${CMAKE_COMMAND} -E copy
+          <BINARY_DIR>/$<CONFIG>/${pbuf_lib_pre}protobuf$<$<CONFIG:Debug>:_d>${ep_lib_suffix}
+          <BINARY_DIR>
+        COMMAND
+          ${CMAKE_COMMAND} -E copy
+          <BINARY_DIR>/$<CONFIG>/protoc${CMAKE_EXECUTABLE_SUFFIX}
+          <BINARY_DIR>
+        >
+    TEST_COMMAND ""
+    INSTALL_COMMAND ""
+    BUILD_BYPRODUCTS
+      <BINARY_DIR>/${pbuf_lib_pre}protobuf${ep_lib_suffix}
+      <BINARY_DIR>/${pbuf_lib_pre}protobuf_d${ep_lib_suffix}
+      <BINARY_DIR>/protoc${CMAKE_EXECUTABLE_SUFFIX}
+  )
+  ExternalProject_Get_Property (protobuf_src BINARY_DIR)
+  ExternalProject_Get_Property (protobuf_src SOURCE_DIR)
+  ExternalProject_Get_Property (protobuf_src STAMP_DIR)
+  if (CMAKE_VERBOSE_MAKEFILE)
+    print_ep_logs (protobuf_src)
+  endif ()
+
+  if (NOT TARGET protobuf::libprotobuf)
+    add_library (protobuf::libprotobuf STATIC IMPORTED GLOBAL)
+  endif ()
+  file (MAKE_DIRECTORY ${SOURCE_DIR}/src)
+  set_target_properties (protobuf::libprotobuf PROPERTIES
+    IMPORTED_LOCATION_DEBUG
+      ${BINARY_DIR}/${pbuf_lib_pre}protobuf_d${ep_lib_suffix}
+    IMPORTED_LOCATION_RELEASE
+      ${BINARY_DIR}/${pbuf_lib_pre}protobuf${ep_lib_suffix}
+    INTERFACE_INCLUDE_DIRECTORIES
+      ${SOURCE_DIR}/src)
+  add_dependencies (protobuf::libprotobuf protobuf_src)
+  exclude_if_included (protobuf_src)
+  exclude_if_included (protobuf::libprotobuf)
+
+  if (NOT TARGET protobuf::protoc)
+    add_executable (protobuf::protoc IMPORTED)
+    exclude_if_included (protobuf::protoc)
+  endif ()
   set_target_properties (protobuf::protoc PROPERTIES
-    IMPORTED_LOCATION "${my_protoc}")
+    IMPORTED_LOCATION "${BINARY_DIR}/protoc${CMAKE_EXECUTABLE_SUFFIX}")
+  add_dependencies (protobuf::protoc protobuf_src)
 endif ()
 
 file (MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/proto_gen)
@@ -980,46 +1297,16 @@ protobuf_generate_cpp (
 set (CMAKE_CURRENT_BINARY_DIR ${save_CBD})
 
 add_library (pbufs STATIC ${PROTO_SRCS} ${PROTO_HDRS})
-if ((NOT TARGET protobuf::libprotobuf) AND (NOT Protobuf_LIBRARIES))
-  message (STATUS "protobuf lib not found - adding unity source for lib")
-  target_sources (pbufs PRIVATE src/ripple/unity/protobuf.cpp)
-  target_include_directories (pbufs
-    PUBLIC
-      src/protobuf/src
-      src/protobuf/vsprojects
-      src/ripple/proto)
-  target_compile_definitions (pbufs
-    PRIVATE
-      _SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS)
-endif ()
+
 target_include_directories (pbufs PRIVATE src)
 target_include_directories (pbufs
-  SYSTEM PUBLIC
-    ${CMAKE_BINARY_DIR}/proto_gen)
-if (NOT MSVC)
-  if (TARGET protobuf::libprotobuf)
-    target_link_libraries (pbufs protobuf::libprotobuf)
-  else ()
-    target_link_libraries (pbufs ${Protobuf_LIBRARIES})
-    target_include_directories (pbufs PUBLIC ${Protobuf_INCLUDE_DIR})
-  endif ()
-endif ()
+  SYSTEM PUBLIC ${CMAKE_BINARY_DIR}/proto_gen)
+target_link_libraries (pbufs protobuf::libprotobuf)
 target_compile_options (pbufs
   PUBLIC
     $<$<BOOL:${is_xcode}>:
       --system-header-prefix="google/protobuf"
       -Wno-deprecated-dynamic-exception-spec
-    >
-    $<$<BOOL:${MSVC}>:
-      -wd4251
-      -wd4146
-    >
-  PRIVATE
-    $<$<BOOL:${MSVC}>:
-      -wd4018
-      -wd4244
-      -wd4800
-      -wd4996
     >)
 add_library (Ripple::pbufs ALIAS pbufs)
 target_link_libraries (ripple_libs INTERFACE Ripple::pbufs)
@@ -1035,22 +1322,23 @@ file (GLOB_RECURSE rb_headers
   src/ripple/beast/*.hpp)
 
 add_library (xrpl_core
-  ${rb_headers} ## headers added here for benefit of IDEs
-  #[===============================[
-      beast/legacy FILES:
-      TODO: review these sources for removal or replacement
-  #]===============================]
-  $<$<BOOL:${unity}>:
+  ${rb_headers}) ## headers added here for benefit of IDEs
+
+#[===============================[
+    beast/legacy FILES:
+    TODO: review these sources for removal or replacement
+#]===============================]
+if (unity)
+  target_sources (xrpl_core PRIVATE
     src/ripple/beast/core/core.unity.cpp
     src/ripple/beast/unity/beast_hash_unity.cpp
     src/ripple/beast/unity/beast_insight_unity.cpp
     src/ripple/beast/unity/beast_net_unity.cpp
-    src/ripple/beast/unity/beast_utility_unity.cpp
-  >
-  $<$<NOT:$<BOOL:${unity}>>:
+    src/ripple/beast/unity/beast_utility_unity.cpp)
+else ()
+  target_sources (xrpl_core PRIVATE
     src/ripple/beast/core/CurrentThreadName.cpp
     src/ripple/beast/core/SemanticVersion.cpp
-    src/ripple/beast/core/WaitableEvent.cpp
     src/ripple/beast/hash/impl/xxhash.cpp
     src/ripple/beast/insight/impl/Collector.cpp
     src/ripple/beast/insight/impl/Groups.cpp
@@ -1062,35 +1350,35 @@ add_library (xrpl_core
     src/ripple/beast/net/impl/IPAddressV4.cpp
     src/ripple/beast/net/impl/IPAddressV6.cpp
     src/ripple/beast/net/impl/IPEndpoint.cpp
-    src/ripple/beast/utility/src/beast_Debug.cpp
     src/ripple/beast/utility/src/beast_Journal.cpp
-    src/ripple/beast/utility/src/beast_PropertyStream.cpp
-  >
-  # END beast/legacy
+    src/ripple/beast/utility/src/beast_PropertyStream.cpp)
+endif ()
 
-  #[===============================[
-     core sources
-  #]===============================]
-  $<$<BOOL:${unity}>:
+#[===============================[
+    core sources
+#]===============================]
+if (unity)
+  target_sources (xrpl_core PRIVATE
     src/ripple/unity/basics1.cpp
     src/ripple/unity/json.cpp
     src/ripple/unity/protocol.cpp
-    src/ripple/unity/crypto.cpp
-  >
-  $<$<NOT:$<BOOL:${unity}>>:
+    src/ripple/unity/crypto.cpp)
+else ()
+  target_sources (xrpl_core PRIVATE
     #[===============================[
-       nounity, main sources:
-         subdir: basics (partial)
+      nounity, main sources:
+        subdir: basics (partial)
     #]===============================]
     src/ripple/basics/impl/base64.cpp
     src/ripple/basics/impl/contract.cpp
     src/ripple/basics/impl/CountedObject.cpp
+    src/ripple/basics/impl/FileUtilities.cpp
     src/ripple/basics/impl/Log.cpp
     src/ripple/basics/impl/strHex.cpp
     src/ripple/basics/impl/StringUtilities.cpp
     #[===============================[
-       nounity, main sources:
-         subdir: json
+      nounity, main sources:
+        subdir: json
     #]===============================]
     src/ripple/json/impl/JsonPropertyStream.cpp
     src/ripple/json/impl/Object.cpp
@@ -1102,8 +1390,8 @@ add_library (xrpl_core
     src/ripple/json/impl/json_writer.cpp
     src/ripple/json/impl/to_string.cpp
     #[===============================[
-       nounity, main sources:
-         subdir: protocol
+      nounity, main sources:
+        subdir: protocol
     #]===============================]
     src/ripple/protocol/impl/AccountID.cpp
     src/ripple/protocol/impl/Book.cpp
@@ -1146,16 +1434,15 @@ add_library (xrpl_core
     src/ripple/protocol/impl/digest.cpp
     src/ripple/protocol/impl/tokens.cpp
     #[===============================[
-       nounity, main sources:
-         subdir: crypto
+      nounity, main sources:
+        subdir: crypto
     #]===============================]
     src/ripple/crypto/impl/GenerateDeterministicKey.cpp
-    src/ripple/crypto/impl/KeyType.cpp
     src/ripple/crypto/impl/RFC1751.cpp
     src/ripple/crypto/impl/csprng.cpp
     src/ripple/crypto/impl/ec_key.cpp
-    src/ripple/crypto/impl/openssl.cpp
-  >)
+    src/ripple/crypto/impl/openssl.cpp)
+endif ()
 add_library (Ripple::xrpl_core ALIAS xrpl_core)
 target_include_directories (xrpl_core
   PUBLIC
@@ -1184,6 +1471,7 @@ install (
     src/ripple/basics/Blob.h
     src/ripple/basics/Buffer.h
     src/ripple/basics/CountedObject.h
+    src/ripple/basics/FileUtilities.h
     src/ripple/basics/LocalValue.h
     src/ripple/basics/Log.h
     src/ripple/basics/Slice.h
@@ -1293,7 +1581,6 @@ install (
   DESTINATION include/ripple/beast/clock)
 install (
   FILES
-    src/ripple/beast/core/CompilerConfig.h
     src/ripple/beast/core/Config.h
     src/ripple/beast/core/ConfigCheck.h
     src/ripple/beast/core/LexicalCast.h
@@ -1369,8 +1656,8 @@ install (
    add_executable with no sources
 #]=========================================================]
 add_executable (rippled src/ripple/app/main/Application.h)
-target_sources (rippled PRIVATE
-  $<$<BOOL:${unity}>:
+if (unity)
+  target_sources (rippled PRIVATE
     #[===============================[
        unity, main sources
     #]===============================]
@@ -1424,9 +1711,9 @@ target_sources (rippled PRIVATE
     src/test/unity/shamap_test_unity.cpp
     src/test/unity/jtx_unity1.cpp
     src/test/unity/jtx_unity2.cpp
-    src/test/unity/csf_unity.cpp
-  >
-  $<$<NOT:$<BOOL:${unity}>>:
+    src/test/unity/csf_unity.cpp)
+else ()
+  target_sources (rippled PRIVATE
     #[===============================[
        nounity, main sources:
          subdir: app
@@ -1553,7 +1840,6 @@ target_sources (rippled PRIVATE
     #]===============================]
     src/ripple/core/impl/Config.cpp
     src/ripple/core/impl/DatabaseCon.cpp
-    src/ripple/core/impl/DummySociDynamicBackend.cpp
     src/ripple/core/impl/Job.cpp
     src/ripple/core/impl/JobQueue.cpp
     src/ripple/core/impl/LoadEvent.cpp
@@ -1561,7 +1847,6 @@ target_sources (rippled PRIVATE
     src/ripple/core/impl/SNTPClock.cpp
     src/ripple/core/impl/SociDB.cpp
     src/ripple/core/impl/Stoppable.cpp
-    src/ripple/core/impl/TerminateHandler.cpp
     src/ripple/core/impl/TimeKeeper.cpp
     src/ripple/core/impl/Workers.cpp
     #[===============================[
@@ -1667,6 +1952,7 @@ target_sources (rippled PRIVATE
     src/ripple/rpc/handlers/CanDelete.cpp
     src/ripple/rpc/handlers/Connect.cpp
     src/ripple/rpc/handlers/ConsensusInfo.cpp
+    src/ripple/rpc/handlers/CrawlShards.cpp
     src/ripple/rpc/handlers/DepositAuthorized.cpp
     src/ripple/rpc/handlers/DownloadShard.cpp
     src/ripple/rpc/handlers/Feature1.cpp
@@ -1708,7 +1994,6 @@ target_sources (rippled PRIVATE
     src/ripple/rpc/handlers/UnlList.cpp
     src/ripple/rpc/handlers/Unsubscribe.cpp
     src/ripple/rpc/handlers/ValidationCreate.cpp
-    src/ripple/rpc/handlers/ValidationSeed.cpp
     src/ripple/rpc/handlers/ValidatorListSites.cpp
     src/ripple/rpc/handlers/Validators.cpp
     src/ripple/rpc/handlers/WalletPropose.cpp
@@ -1766,6 +2051,7 @@ target_sources (rippled PRIVATE
     src/test/app/PayChan_test.cpp
     src/test/app/PayStrand_test.cpp
     src/test/app/PseudoTx_test.cpp
+    src/test/app/RCLCensorshipDetector_test.cpp
     src/test/app/RCLValidations_test.cpp
     src/test/app/Regression_test.cpp
     src/test/app/SHAMapStore_test.cpp
@@ -1786,6 +2072,7 @@ target_sources (rippled PRIVATE
     #]===============================]
     src/test/basics/Buffer_test.cpp
     src/test/basics/DetectCrash_test.cpp
+    src/test/basics/FileUtilities_test.cpp
     src/test/basics/KeyCache_test.cpp
     src/test/basics/PerfLog_test.cpp
     src/test/basics/RangeSet_test.cpp
@@ -1816,7 +2103,6 @@ target_sources (rippled PRIVATE
     src/test/beast/beast_asio_error_test.cpp
     src/test/beast/beast_basic_seconds_clock_test.cpp
     src/test/beast/beast_io_latency_probe_test.cpp
-    src/test/beast/beast_weak_fn_test.cpp
     src/test/beast/define_print.cpp
     #[===============================[
        nounity, test sources:
@@ -1845,7 +2131,6 @@ target_sources (rippled PRIVATE
     src/test/core/JobQueue_test.cpp
     src/test/core/SociDB_test.cpp
     src/test/core/Stoppable_test.cpp
-    src/test/core/TerminateHandler_test.cpp
     src/test/core/Workers_test.cpp
     #[===============================[
        nounity, test sources:
@@ -1995,6 +2280,7 @@ target_sources (rippled PRIVATE
     src/test/rpc/NoRipple_test.cpp
     src/test/rpc/OwnerInfo_test.cpp
     src/test/rpc/Peers_test.cpp
+    src/test/rpc/RPCCall_test.cpp
     src/test/rpc/RPCOverload_test.cpp
     src/test/rpc/RobustTransaction_test.cpp
     src/test/rpc/ServerInfo_test.cpp
@@ -2020,8 +2306,8 @@ target_sources (rippled PRIVATE
        nounity, test sources:
          subdir: unit_test
     #]===============================]
-    src/test/unit_test/multi_runner.cpp
-    >)
+    src/test/unit_test/multi_runner.cpp)
+endif ()
 target_link_libraries (rippled
   Ripple::opts
   Ripple::libs
@@ -2082,15 +2368,124 @@ if (is_root_project)
 endif ()
 
 #[===================================================================[
+   coverage report target
+#]===================================================================]
+
+if (coverage)
+  if (is_clang)
+    if (APPLE)
+      execute_process (COMMAND xcrun -f llvm-profdata
+        OUTPUT_VARIABLE LLVM_PROFDATA
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    else ()
+      find_program (LLVM_PROFDATA llvm-profdata)
+    endif ()
+    if (NOT LLVM_PROFDATA)
+      message (WARNING "unable to find llvm-profdata - skipping coverage_report target")
+    endif ()
+
+    if (APPLE)
+      execute_process (COMMAND xcrun -f llvm-cov
+        OUTPUT_VARIABLE LLVM_COV
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    else ()
+      find_program (LLVM_COV llvm-cov)
+    endif ()
+    if (NOT LLVM_COV)
+      message (WARNING "unable to find llvm-cov - skipping coverage_report target")
+    endif ()
+
+    set (extract_pattern "")
+    if (coverage_core_only)
+      set (extract_pattern "${CMAKE_SOURCE_DIR}/src/ripple/")
+    endif ()
+
+    if (LLVM_COV AND LLVM_PROFDATA)
+      add_custom_target (coverage_report
+        USES_TERMINAL
+        COMMAND ${CMAKE_COMMAND} -E echo "Generating coverage - results will be in ${CMAKE_BINARY_DIR}/coverage/index.html."
+        COMMAND ${CMAKE_COMMAND} -E echo "Running rippled tests."
+        COMMAND rippled --unittest$<$<BOOL:${coverage_test}>:=${coverage_test}> --quiet --unittest-log
+        COMMAND ${LLVM_PROFDATA}
+          merge -sparse default.profraw -o rip.profdata
+        COMMAND ${LLVM_COV}
+          show -format=html -output-dir=${CMAKE_BINARY_DIR}/coverage
+          -instr-profile=rip.profdata
+          $<TARGET_FILE:rippled> ${extract_pattern}
+        BYPRODUCTS coverage/index.html)
+    endif ()
+  elseif (is_gcc)
+    find_program (LCOV lcov)
+    if (NOT LCOV)
+      message (WARNING "unable to find lcov - skipping coverage_report target")
+    endif ()
+
+    find_program (GENHTML genhtml)
+    if (NOT GENHTML)
+      message (WARNING "unable to find genhtml - skipping coverage_report target")
+    endif ()
+
+    set (extract_pattern "*")
+    if (coverage_core_only)
+      set (extract_pattern "*/src/ripple/*")
+    endif ()
+
+    if (LCOV AND GENHTML)
+      add_custom_target (coverage_report
+        USES_TERMINAL
+        COMMAND ${CMAKE_COMMAND} -E echo "Generating coverage- results will be in ${CMAKE_BINARY_DIR}/coverage/index.html."
+        # create baseline info file
+        COMMAND ${LCOV}
+          --no-external -d "${CMAKE_SOURCE_DIR}" -c -d . -i -o baseline.info
+          | grep -v "ignoring data for external file"
+        # run tests
+        COMMAND ${CMAKE_COMMAND} -E echo "Running rippled tests for coverage report."
+        COMMAND rippled --unittest$<$<BOOL:${coverage_test}>:=${coverage_test}> --quiet --unittest-log
+        # Create test coverage data file
+        COMMAND ${LCOV}
+          --no-external -d "${CMAKE_SOURCE_DIR}" -c -d . -o tests.info
+          | grep -v "ignoring data for external file"
+        # Combine baseline and test coverage data
+        COMMAND ${LCOV}
+          -a baseline.info -a tests.info -o lcov-all.info
+        # extract our files
+        COMMAND ${LCOV}
+          -e lcov-all.info "${extract_pattern}" -o lcov.info
+        # generate HTML report
+        COMMAND ${GENHTML}
+          -o ${CMAKE_BINARY_DIR}/coverage lcov.info
+        BYPRODUCTS coverage/index.html)
+    endif ()
+  endif ()
+endif ()
+
+#[===================================================================[
    multiconfig misc
 #]===================================================================]
 
 if (is_multiconfig)
-  # Rippled headers. Only useful for IDEs.
-  file (GLOB_RECURSE rippled_headers src/*.h src/*.hpp *.md)
-  target_sources (rippled PRIVATE ${rippled_headers})
+  # This code finds all source files in the src subdirectory for inclusion
+  # in the IDE file tree as non-compiled sources. Since this file list will
+  # have some overlap with files we have already added to our targets to
+  # be compiled, we explicitly remove any of these target source files from
+  # this list.
+  file (GLOB_RECURSE all_sources RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
+    CONFIGURE_DEPENDS
+    src/*.* Builds/*.md docs/*.md src/*.md Builds/*.cmake)
+  file(GLOB md_files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} CONFIGURE_DEPENDS
+    *.md)
+  LIST(APPEND all_sources ${md_files})
+  foreach (_target secp256k1 ed25519-donna rocksdb pbufs xrpl_core rippled)
+    get_target_property (_type ${_target} TYPE)
+    if(_type STREQUAL "INTERFACE_LIBRARY")
+      continue()
+    endif()
+    get_target_property (_src ${_target} SOURCES)
+    list (REMOVE_ITEM all_sources ${_src})
+  endforeach ()
+  target_sources (rippled PRIVATE ${all_sources})
   set_property (
-    SOURCE ${rippled_headers}
+    SOURCE ${all_sources}
     APPEND
     PROPERTY HEADER_FILE_ONLY true)
   if (MSVC)
@@ -2098,9 +2493,7 @@ if (is_multiconfig)
       DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       PROPERTY VS_STARTUP_PROJECT rippled)
   endif ()
-endif ()
 
-if (is_multiconfig)
   group_sources(src)
   group_sources(docs)
   group_sources(Builds)
@@ -2137,3 +2530,4 @@ if (TARGET Doxygen::doxygen)
 else ()
   message (STATUS "doxygen executable not found -- skipping docs target")
 endif ()
+

@@ -599,6 +599,16 @@ ServerHandlerImp::processRequest (Port const& port,
     {
         Json::Value const& jsonRPC =
             batch ? jsonOrig[jss::params][i] : jsonOrig;
+
+        if (!jsonRPC.isObject())
+        {
+            Json::Value r(Json::objectValue);
+            r[jss::request] = jsonRPC;
+            r[jss::error] = make_json_error(method_not_found, "Method not found");
+            reply.append(r);
+            continue;
+        }
+
         /* ------------------------------------------------------------------ */
         auto role = Role::FORBID;
         auto required = Role::FORBID;
@@ -740,8 +750,26 @@ ServerHandlerImp::processRequest (Port const& port,
         }
 
         std::string ripplerpc = "1.0";
-        if (params.isMember(jss::ripplerpc) && params[jss::ripplerpc] != "1.0")
+        if (params.isMember(jss::ripplerpc))
+        {
+            if (!params[jss::ripplerpc].isString())
+            {
+                usage.charge(Resource::feeInvalidRPC);
+                if (!batch)
+                {
+                    HTTPReply(400, "ripplerpc is not a string", output, rpcJ);
+                    return;
+                }
+
+                Json::Value r = jsonRPC;
+                r[jss::error] = make_json_error(
+                    method_not_found, "ripplerpc is not a string");
+                reply.append(r);
+                continue;
+            }
             ripplerpc = params[jss::ripplerpc].asString();
+        }
+
         /**
          * Clear header-assigned values if not positively identified from a
          * secure_gateway.
@@ -779,15 +807,15 @@ ServerHandlerImp::processRequest (Port const& port,
                 result["code"] = result[jss::error_code];
                 result["message"] = result[jss::error_message];
                 result.removeMember(jss::error_message);
-                r[jss::error] = std::move(result);
                 JLOG (m_journal.debug())  <<
                     "rpcError: " << result [jss::error] <<
                     ": " << result [jss::error_message];
+                r[jss::error] = std::move(result);
             }
             else
             {
-                 result[jss::status]  = jss::success;
-                 r[jss::result] = std::move(result);
+                result[jss::status]  = jss::success;
+                r[jss::result] = std::move(result);
             }
         }
         else

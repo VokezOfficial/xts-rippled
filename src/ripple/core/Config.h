@@ -81,9 +81,6 @@ public:
     /** Returns the full path and filename of the debug log file. */
     boost::filesystem::path getDebugLogFile () const;
 
-    /** Returns the full path and filename of the entropy seed file. */
-    boost::filesystem::path getEntropyFile () const;
-
 private:
     boost::filesystem::path CONFIG_FILE;
 public:
@@ -184,7 +181,9 @@ public:
     std::unordered_set<uint256, beast::uhash<>> features;
 
 public:
-    Config() = default;
+    Config()
+    : j_ {beast::Journal::getNullSink()}
+    { }
 
     int getSize (SizedItemName) const;
     /* Be very careful to make sure these bool params

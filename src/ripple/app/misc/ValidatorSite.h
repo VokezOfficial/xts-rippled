@@ -79,26 +79,25 @@ private:
 
         struct Resource
         {
-            explicit Resource(std::string u);
-            std::string uri;
+            explicit Resource(std::string uri_);
+            const std::string uri;
             parsedURL pUrl;
         };
-        using ResourcePtr = std::shared_ptr<Resource>;
 
         explicit Site(std::string uri);
 
         /// the original uri as loaded from config
-        ResourcePtr loadedResource;
+        std::shared_ptr<Resource> loadedResource;
 
-        /// the resource to to request at <timer>
+        /// the resource to request at <timer>
         /// intervals. same as loadedResource
         /// except in the case of a permanent redir.
-        ResourcePtr startingResource;
+        std::shared_ptr<Resource> startingResource;
 
         /// the active resource being requested.
         /// same as startingResource except
         /// when we've gotten a temp redirect
-        ResourcePtr activeResource;
+        std::shared_ptr<Resource> activeResource;
 
         unsigned short redirCount;
         std::chrono::minutes refreshInterval;
@@ -201,11 +200,18 @@ private:
         detail::response_type&& res,
         std::size_t siteIdx);
 
+    /// Store latest list fetched from anywhere
+    void
+    onTextFetch(
+        boost::system::error_code const& ec,
+        std::string const& res,
+        std::size_t siteIdx);
+
     /// Initiate request to given resource.
     /// lock over sites_mutex_ required
     void
     makeRequest (
-        Site::ResourcePtr resource,
+        std::shared_ptr<Site::Resource> resource,
         std::size_t siteIdx,
         std::lock_guard<std::mutex>& lock);
 
@@ -213,13 +219,13 @@ private:
     /// lock over sites_mutex_ required
     void
     parseJsonResponse (
-        detail::response_type& res,
+        std::string const& res,
         std::size_t siteIdx,
         std::lock_guard<std::mutex>& lock);
 
     /// Interpret a redirect response.
     /// lock over sites_mutex_ required
-    Site::ResourcePtr
+    std::shared_ptr<Site::Resource>
     processRedirect (
         detail::response_type& res,
         std::size_t siteIdx,

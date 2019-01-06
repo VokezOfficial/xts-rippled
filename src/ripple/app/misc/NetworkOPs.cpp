@@ -58,6 +58,9 @@
 #include <ripple/basics/make_lock.h>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/ip/host_name.hpp>
+#include <string>
+#include <tuple>
+#include <utility>
 
 namespace ripple {
 
@@ -150,11 +153,18 @@ class NetworkOPsImp final
         void mode (OperatingMode om);
 
         /**
+         * Json-formatted state accounting data.
+         * 1st member: state accounting object.
+         * 2nd member: duration in current state.
+         */
+        using StateCountersJson = std::pair <Json::Value, std::string>;
+
+        /**
          * Output state counters in JSON format.
          *
          * @return JSON object.
          */
-        Json::Value json() const;
+        StateCountersJson json() const;
     };
 
     //! Server fees published on `server` subscription
@@ -163,7 +173,7 @@ class NetworkOPsImp final
         ServerFeeSummary() = default;
 
         ServerFeeSummary(std::uint64_t fee,
-                         boost::optional<TxQ::Metrics>&& escalationMetrics,
+                         TxQ::Metrics&& escalationMetrics,
                          LoadFeeTrack const & loadFeeTrack);
         bool
         operator !=(ServerFeeSummary const & b) const;
@@ -1330,10 +1340,12 @@ bool NetworkOPsImp::checkLastClosedLedger (
             closedLedger, 0, InboundLedger::Reason::CONSENSUS);
 
     if (consensus &&
-        !m_ledgerMaster.isCompatible(
-            *consensus, m_journal.debug(), "Not switching"))
+        (!m_ledgerMaster.canBeCurrent (consensus) ||
+            !m_ledgerMaster.isCompatible(
+                *consensus, m_journal.debug(), "Not switching")))
     {
         // Don't switch to a ledger not on the validated chain
+        // or with an invalid close time or sequence
         networkClosed = ourClosed->info().hash;
         return false;
     }
@@ -1587,7 +1599,7 @@ void NetworkOPsImp::pubManifest (Manifest const& mo)
 
 NetworkOPsImp::ServerFeeSummary::ServerFeeSummary(
         std::uint64_t fee,
-        boost::optional<TxQ::Metrics>&& escalationMetrics,
+        TxQ::Metrics&& escalationMetrics,
         LoadFeeTrack const & loadFeeTrack)
     : loadFactorServer{loadFeeTrack.getLoadFactor()}
     , loadBaseServer{loadFeeTrack.getLoadBase()}
@@ -1609,8 +1621,8 @@ NetworkOPsImp::ServerFeeSummary::operator !=(NetworkOPsImp::ServerFeeSummary con
 
     if(em && b.em)
     {
-        return (em->minFeeLevel != b.em->minFeeLevel ||
-                em->expFeeLevel != b.em->expFeeLevel ||
+        return (em->minProcessingFeeLevel != b.em->minProcessingFeeLevel ||
+                em->openLedgerFeeLevel != b.em->openLedgerFeeLevel ||
                 em->referenceFeeLevel != b.em->referenceFeeLevel);
     }
 
@@ -1653,12 +1665,12 @@ void NetworkOPsImp::pubServer ()
         {
             auto const loadFactor =
                 std::max(static_cast<std::uint64_t>(f.loadFactorServer),
-                    mulDiv(f.em->expFeeLevel, f.loadBaseServer,
+                    mulDiv(f.em->openLedgerFeeLevel, f.loadBaseServer,
                         f.em->referenceFeeLevel).second);
 
             jvObj [jss::load_factor]   = clamp(loadFactor);
-            jvObj [jss::load_factor_fee_escalation] = clamp(f.em->expFeeLevel);
-            jvObj [jss::load_factor_fee_queue] = clamp(f.em->minFeeLevel);
+            jvObj [jss::load_factor_fee_escalation] = clamp(f.em->openLedgerFeeLevel);
+            jvObj [jss::load_factor_fee_queue] = clamp(f.em->minProcessingFeeLevel);
             jvObj [jss::load_factor_fee_reference]
                 = clamp(f.em->referenceFeeLevel);
 
@@ -2208,43 +2220,40 @@ Json::Value NetworkOPsImp::getServerInfo (bool human, bool admin, bool counters)
     auto const escalationMetrics = app_.getTxQ().getMetrics(
         *app_.openLedger().current());
 
-    constexpr std::uint64_t max32 =
-        std::numeric_limits<std::uint32_t>::max();
-
     auto const loadFactorServer = app_.getFeeTrack().getLoadFactor();
     auto const loadBaseServer = app_.getFeeTrack().getLoadBase();
-    auto const loadFactorFeeEscalation = escalationMetrics ?
-        escalationMetrics->expFeeLevel : 1;
-    auto const loadBaseFeeEscalation = escalationMetrics ?
-        escalationMetrics->referenceFeeLevel : 1;
+    auto const loadFactorFeeEscalation =
+        escalationMetrics.openLedgerFeeLevel;
+    auto const loadBaseFeeEscalation =
+        escalationMetrics.referenceFeeLevel;
 
     auto const loadFactor = std::max(static_cast<std::uint64_t>(loadFactorServer),
         mulDiv(loadFactorFeeEscalation, loadBaseServer, loadBaseFeeEscalation).second);
 
     if (!human)
     {
+        constexpr std::uint64_t max32 =
+            std::numeric_limits<std::uint32_t>::max();
+
         info[jss::load_base] = loadBaseServer;
         info[jss::load_factor] = static_cast<std::uint32_t>(
             std::min(max32, loadFactor));
-        if (escalationMetrics)
-        {
-            info[jss::load_factor_server] = loadFactorServer;
+        info[jss::load_factor_server] = loadFactorServer;
 
-            /* Json::Value doesn't support uint64, so clamp to max
-                uint32 value. This is mostly theoretical, since there
-                probably isn't enough extant XRP to drive the factor
-                that high.
-            */
-            info[jss::load_factor_fee_escalation] =
-                static_cast<std::uint32_t> (std::min(
-                    max32, loadFactorFeeEscalation));
-            info[jss::load_factor_fee_queue] =
-                static_cast<std::uint32_t> (std::min(
-                    max32, escalationMetrics->minFeeLevel));
-            info[jss::load_factor_fee_reference] =
-                static_cast<std::uint32_t> (std::min(
-                    max32, loadBaseFeeEscalation));
-        }
+        /* Json::Value doesn't support uint64, so clamp to max
+            uint32 value. This is mostly theoretical, since there
+            probably isn't enough extant XRP to drive the factor
+            that high.
+        */
+        info[jss::load_factor_fee_escalation] =
+            static_cast<std::uint32_t> (std::min(
+                max32, loadFactorFeeEscalation));
+        info[jss::load_factor_fee_queue] =
+            static_cast<std::uint32_t> (std::min(
+                max32, escalationMetrics.minProcessingFeeLevel));
+        info[jss::load_factor_fee_reference] =
+            static_cast<std::uint32_t> (std::min(
+                max32, loadBaseFeeEscalation));
     }
     else
     {
@@ -2269,20 +2278,18 @@ Json::Value NetworkOPsImp::getServerInfo (bool human, bool admin, bool counters)
                 info[jss::load_factor_cluster] =
                     static_cast<double> (fee) / loadBaseServer;
         }
-        if (escalationMetrics)
-        {
-            if (loadFactorFeeEscalation !=
-                    escalationMetrics->referenceFeeLevel &&
-                        (admin || loadFactorFeeEscalation != loadFactor))
-                info[jss::load_factor_fee_escalation] =
-                    static_cast<double> (loadFactorFeeEscalation) /
-                        escalationMetrics->referenceFeeLevel;
-            if (escalationMetrics->minFeeLevel !=
-                    escalationMetrics->referenceFeeLevel)
-                info[jss::load_factor_fee_queue] =
-                    static_cast<double> (escalationMetrics->minFeeLevel) /
-                        escalationMetrics->referenceFeeLevel;
-        }
+        if (loadFactorFeeEscalation !=
+                escalationMetrics.referenceFeeLevel &&
+                    (admin || loadFactorFeeEscalation != loadFactor))
+            info[jss::load_factor_fee_escalation] =
+                static_cast<double> (loadFactorFeeEscalation) /
+                    escalationMetrics.referenceFeeLevel;
+        if (escalationMetrics.minProcessingFeeLevel !=
+                escalationMetrics.referenceFeeLevel)
+            info[jss::load_factor_fee_queue] =
+                static_cast<double> (
+                    escalationMetrics.minProcessingFeeLevel) /
+                        escalationMetrics.referenceFeeLevel;
     }
 
     bool valid = false;
@@ -2356,7 +2363,8 @@ Json::Value NetworkOPsImp::getServerInfo (bool human, bool admin, bool counters)
             info[jss::published_ledger] = lpPublished->info().seq;
     }
 
-    info[jss::state_accounting] = accounting_.json();
+    std::tie(info[jss::state_accounting],
+        info[jss::server_state_duration_us]) = accounting_.json();
     info[jss::uptime] = UptimeClock::now().time_since_epoch().count();
     info[jss::jq_trans_overflow] = std::to_string(
         app_.overlay().getJqTransOverflow());
@@ -3341,7 +3349,8 @@ void NetworkOPsImp::StateAccounting::mode (OperatingMode om)
     start_ = now;
 }
 
-Json::Value NetworkOPsImp::StateAccounting::json() const
+NetworkOPsImp::StateAccounting::StateCountersJson
+NetworkOPsImp::StateAccounting::json() const
 {
     std::unique_lock<std::mutex> lock (mutex_);
 
@@ -3351,8 +3360,9 @@ Json::Value NetworkOPsImp::StateAccounting::json() const
 
     lock.unlock();
 
-    counters[mode].dur += std::chrono::duration_cast<
+    auto const current = std::chrono::duration_cast<
         std::chrono::microseconds>(std::chrono::system_clock::now() - start);
+    counters[mode].dur += current;
 
     Json::Value ret = Json::objectValue;
 
@@ -3365,7 +3375,7 @@ Json::Value NetworkOPsImp::StateAccounting::json() const
         state[jss::duration_us] = std::to_string(counters[i].dur.count());
     }
 
-    return ret;
+    return {ret, std::to_string(current.count())};
 }
 
 //------------------------------------------------------------------------------
