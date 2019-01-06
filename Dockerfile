@@ -8,4 +8,3 @@ RUN    cd /opt/source/xts-rippled/ && mkdir _xts && cd _xts && export CXXFLAGS="
     cmake  --build . -- -j 2
 
 
-CMD ["/bin/bash"," -c "," /opt/source/xts-rippled/_xts/rippled"]
