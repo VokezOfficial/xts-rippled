@@ -8,3 +8,8 @@ RUN    cd /opt/source/xts-rippled/ && mkdir _xts && cd _xts && export CXXFLAGS="
     cmake  --build . -- -j 2
 
 
+ADD rippled-xts.cfg /etc/opt/ripple/rippled.cfg
+ADD validators-xts.txt /etc/opt/ripple/validators.txt
+
+
+CMD ["/opt/source/xts-rippled/_xts/rippled"]
