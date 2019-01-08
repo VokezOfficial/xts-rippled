@@ -98,7 +98,7 @@ pool.ntp.org
 # Where to find some other servers speaking the Ripple protocol.
 #
 [ips]
-r.ripple.com 51235
+r.vokez.io 51235
 
 # Turn down default logging to save disk space in the long run.
 # Valid values here are trace, debug, info, warning, error, and fatal

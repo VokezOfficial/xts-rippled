@@ -117,13 +117,13 @@ private:
 
         // load should accept valid validator site uris
         std::vector<std::string> cfgSites({
-            "http://ripple.com/",
-            "http://ripple.com/validators",
-            "http://ripple.com:8080/validators",
+            "http://vokez.io/",
+            "http://vokez.io/validators",
+            "http://vokez.io:8080/validators",
             "http://207.261.33.37/validators",
             "http://207.261.33.37:8080/validators",
-            "https://ripple.com/validators",
-            "https://ripple.com:443/validators",
+            "https://vokez.io/validators",
+            "https://vokez.io:443/validators",
             "file:///etc/opt/ripple/validators.txt",
             "file:///C:/Lib/validators.txt"
 #if !_MSC_VER
@@ -134,17 +134,17 @@ private:
 
         // load should reject validator site uris with invalid schemes
         std::vector<std::string> badSites(
-            {"ftp://ripple.com/validators"});
+            {"ftp://vokez.io/validators"});
         BEAST_EXPECT(!trustedSites->load (badSites));
 
-        badSites[0] = "wss://ripple.com/validators";
+        badSites[0] = "wss://vokez.io/validators";
         BEAST_EXPECT(!trustedSites->load (badSites));
 
-        badSites[0] = "ripple.com/validators";
+        badSites[0] = "vokez.io/validators";
         BEAST_EXPECT(!trustedSites->load (badSites));
 
         // Host names are not supported for file URLs
-        badSites[0] = "file://ripple.com/vl.txt";
+        badSites[0] = "file://vokez.io/vl.txt";
         BEAST_EXPECT(!trustedSites->load (badSites));
 
         // Even local host names are not supported for file URLs

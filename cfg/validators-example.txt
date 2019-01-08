@@ -26,10 +26,10 @@
 #   List of URIs serving lists of recommended validators.
 #
 #   The latest list of recommended validator sites can be
-#   obtained from https://ripple.com/ripple.txt
+#   obtained from https://vokez.io/ripple.txt
 #
 #   Examples:
-#    https://vl.ripple.com
+#    https://vl.vokez.io
 #    http://127.0.0.1:8000
 #    file:///etc/opt/ripple/vl.txt
 #
@@ -42,7 +42,7 @@
 #   Validator list keys should be hex-encoded.
 #
 #   The latest list of recommended validator keys can be
-#   obtained from https://ripple.com/ripple.txt
+#   obtained from https://vokez.io/ripple.txt
 #
 #   Examples:
 #    ed499d732bded01504a7407c224412ef550cc1ade638a4de4eb88af7c36cb8b282
@@ -60,12 +60,12 @@
 #          See: https://arxiv.org/pdf/1802.07242.pdf
 
 [validator_list_sites]
-https://vl.ripple.com
+https://vl.vokez.io
 
 [validator_list_keys]
 ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
 
-# To use the XRP test network (see https://ripple.com/build/xrp-test-net/),
+# To use the XRP test network (see https://vokez.io/build/xrp-test-net/),
 # use the following configuration instead:
 #
 # [validator_list_sites]

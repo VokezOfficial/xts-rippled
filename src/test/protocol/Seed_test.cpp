@@ -124,8 +124,8 @@ public:
 
     void testKeypairGenerationAndSigning ()
     {
-        std::string const message1 = "http://www.ripple.com";
-        std::string const message2 = "https://www.ripple.com";
+        std::string const message1 = "http://www.vokez.io";
+        std::string const message2 = "https://www.vokez.io";
 
         {
             testcase ("Node keypair generation & signing (secp256k1)");
