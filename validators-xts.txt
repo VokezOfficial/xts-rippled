@@ -59,11 +59,19 @@
 #          do not sufficiently overlap with the list(s) used by others.
 #          See: https://arxiv.org/pdf/1802.07242.pdf
 
-[validator_list_sites]
-https://vl.vokez.io
+#[validator_list_sites]
+#https://vl.ripple.com
 
-[validator_list_keys]
-ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
+#[validator_list_keys]
+#ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
+
+
+[validators]
+nHD3WNcuk65oF4zo7EmsGkrfZdZDzJndphZ1cR3jwkq9uuRq7QF4 r
+nHDNnwRMG7SbsgvD3pcFtpPoTiCAe9LjeewAXAtooG7e7HP7oiMU east
+nHBzYU4JymD2ke3fATAQ6MGYikGbqaYrZqvo7X75927cSFrh2W3Q west
+
+
 
 # To use the XRP test network (see https://vokez.io/build/xrp-test-net/),
 # use the following configuration instead:
