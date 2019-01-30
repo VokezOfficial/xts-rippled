@@ -63,6 +63,11 @@ struct PseudoTx_test : public beast::unit_test::suite
             obj.setAccountID(sfDestination, AccountID(3));
         }));
 
+        res.emplace_back(STTx(ttSTIPEND, [&](auto& obj) {
+            obj.setAccountID(sfAccount, AccountID(2));
+            obj.setAccountID(sfDestination, AccountID(3));
+        }));
+
         return res;
     }
 

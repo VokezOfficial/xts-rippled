@@ -28,7 +28,9 @@
 #include <ripple/core/Config.h>
 #include <ripple/core/ConfigSections.h>
 #include <ripple/core/DatabaseCon.h>
+#include <ripple/core/TerminateHandler.h>
 #include <ripple/core/TimeKeeper.h>
+#include <ripple/crypto/csprng.h>
 #include <ripple/json/to_string.h>
 #include <ripple/net/RPCCall.h>
 #include <ripple/resource/Fees.h>
@@ -36,6 +38,7 @@
 #include <ripple/protocol/BuildInfo.h>
 #include <ripple/beast/clock/basic_seconds_clock.h>
 #include <ripple/beast/core/CurrentThreadName.h>
+#include <ripple/beast/utility/Debug.h>
 
 #include <beast/unit_test/dstream.hpp>
 #include <beast/unit_test/global_suites.hpp>
@@ -61,9 +64,29 @@
 #include <sys/timeb.h>
 #endif
 
+// xts
+#include <iostream>
+#include <sstream>
+
+#include <ipfs/include/ipfs/client.h>
+#include <ipfs/include/ipfs/http/transport-curl.h>
+#include <ipfs/include/ipfs/http/transport.h>
+
+
+
+
 namespace po = boost::program_options;
 
 namespace ripple {
+
+boost::filesystem::path
+getEntropyFile(Config const& config)
+{
+    auto const path = config.legacy("database_path");
+    if (path.empty ())
+        return {};
+    return boost::filesystem::path (path) / "random.seed";
+}
 
 bool
 adjustDescriptorLimit(int needed, beast::Journal j)
@@ -161,6 +184,7 @@ void printHelp (const po::options_description& desc)
            "     submit_multisigned <tx_json>\n"
            "     tx <id>\n"
            "     validation_create [<seed>|<pass_phrase>|<key>]\n"
+           "     validation_seed [<seed>|<pass_phrase>|<key>]\n"
            "     wallet_propose [<passphrase>]\n";
 }
 
@@ -476,6 +500,13 @@ int run (int argc, char** argv)
     config->setup (configFile, bool (vm.count ("quiet")),
         bool(vm.count("silent")), bool(vm.count("standalone")));
 
+    {
+        // Stir any previously saved entropy into the pool:
+        auto entropy = getEntropyFile (*config);
+        if (!entropy.empty ())
+            crypto_prng().load_state(entropy.string ());
+    }
+
     if (vm.count("vacuum"))
     {
         DatabaseCon::Setup dbSetup = setup_DatabaseCon(*config);
@@ -620,8 +651,7 @@ int run (int argc, char** argv)
                 std::cerr << "WARNING: using deprecated rpc_port param.\n";
                 try
                 {
-                    res.first = res.first.at_port(
-                        vm["rpc_port"].as<std::uint16_t>());
+                    res.first.at_port(vm["rpc_port"].as<std::uint16_t>());
                     if (res.first.port() == 0)
                         throw std::domain_error("0");
                 }
@@ -719,6 +749,11 @@ int run (int argc, char** argv)
         // Block until we get a stop RPC.
         app->run();
 
+        // Try to write out some entropy to use the next time we start.
+        auto entropy = getEntropyFile (app->config());
+        if (!entropy.empty ())
+            crypto_prng().save_state(entropy.string ());
+
         return 0;
     }
 
@@ -764,7 +799,31 @@ int main (int argc, char** argv)
         "GCC version 5.1.0 or later is required to compile rippled.");
 #endif
 
+    //
+    // These debug heap calls do nothing in release or non Visual Studio builds.
+    //
+
+    // Checks the heap at every allocation and deallocation (slow).
+    //
+    //beast::Debug::setAlwaysCheckHeap (false);
+
+    // Keeps freed memory blocks and fills them with a guard value.
+    //
+    //beast::Debug::setHeapDelayedFree (false);
+
+    // At exit, reports all memory blocks which have not been freed.
+    //
+#if RIPPLE_DUMP_LEAKS_ON_EXIT
+    beast::Debug::setHeapReportLeaks (true);
+#else
+    beast::Debug::setHeapReportLeaks (false);
+#endif
+
+
+
     atexit(&google::protobuf::ShutdownProtobufLibrary);
+
+    std::set_terminate(ripple::terminateHandler);
 
     auto const result (ripple::run (argc, argv));
 

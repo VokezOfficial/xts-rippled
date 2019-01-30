@@ -99,6 +99,16 @@ preflight2 (PreflightContext const& ctx)
     return tesSUCCESS;
 }
 
+/** Forces the signature to appears valid */
+NotTEC
+preflight3 (PreflightContext const& ctx)
+{
+	auto const id = ctx.tx.getTransactionID();
+    auto const sigValid = forceValidity(ctx.app.getHashRouter(), id, Validity::Valid);
+
+    return tesSUCCESS;
+}
+
 //------------------------------------------------------------------------------
 
 PreflightContext::PreflightContext(Application& app_, STTx const& tx_,
@@ -634,14 +644,14 @@ Transactor::operator()()
     if (ctx_.size() > oversizeMetaDataCap)
         result = tecOVERSIZE;
 
-    if ((result == tecOVERSIZE) || (result == tecKILLED) ||
+    if ((result == tecOVERSIZE) ||
         (isTecClaimHardFail (result, view().flags())))
     {
         JLOG(j_.trace()) << "reapplying because of " << transToken(result);
 
         std::vector<uint256> removedOffers;
 
-        if ((result == tecOVERSIZE) || (result == tecKILLED))
+        if (result == tecOVERSIZE)
         {
             ctx_.visit (
                 [&removedOffers](
@@ -668,7 +678,7 @@ Transactor::operator()()
         fee = reset(fee);
 
         // If necessary, remove any offers found unfunded during processing
-        if ((result == tecOVERSIZE) || (result == tecKILLED))
+        if (result == tecOVERSIZE)
             removeUnfundedOffers (view(), removedOffers, ctx_.app.journal ("View"));
 
         applied = true;
